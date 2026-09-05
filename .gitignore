@@ -1,0 +1,48 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Runtime output and packaged builds may contain screenshots or copied credentials.
+logs/
+dist/
+*.log
+*.zip
+
+# Local credentials and machine-specific settings.
+sgzz_accounts.txt
+sgzz_like_target.txt
+config.toml
+.env
+.env.*
+!.env.example
+
+# Private keys and signing files.
+*.keystore
+*.jks
+*.p12
+*.pem
+*.key
+
+# IDE and OS metadata.
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Build caches and generated binaries.
+.gradle/
+**/build/
+local.properties
+*.apk
+*.aab
+
+# Obsolete APK/App control experiments are not part of the ADB-only server release.
+android_overlay_bridge/
+remote_app_control/android/
+
+# Debug composites can include transient in-game information.
+assets/templates/**/contact_sheet*.png

@@ -1,0 +1,1 @@
+# Copy this file to sgzz_like_target.txt and put the target player ID on one line.

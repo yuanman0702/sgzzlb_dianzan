@@ -1,0 +1,58 @@
+{
+  "name": "weibo_state_machine_demo",
+  "initial": "launch_weibo",
+  "tick_interval_seconds": 0.5,
+  "max_steps": 30,
+  "max_runtime_seconds": 15,
+  "states": {
+    "launch_weibo": {
+      "on_enter": [
+        {
+          "type": "launch_package",
+          "package": "com.sina.weibo"
+        },
+        {
+          "type": "sleep",
+          "seconds": 2.0
+        },
+        {
+          "type": "screenshot",
+          "name": "weibo_state_launch.png"
+        }
+      ],
+      "transitions": [
+        {
+          "target": "opened",
+          "when": {
+            "type": "focus_contains",
+            "text": "com.sina.weibo"
+          }
+        }
+      ],
+      "timeout_seconds": 6.0,
+      "on_timeout": "failed"
+    },
+    "opened": {
+      "on_enter": [
+        {
+          "type": "log",
+          "message": "Weibo focus detected. State machine is alive."
+        }
+      ],
+      "terminal": true
+    },
+    "failed": {
+      "on_enter": [
+        {
+          "type": "log",
+          "message": "Weibo did not become focused before timeout."
+        },
+        {
+          "type": "screenshot",
+          "name": "weibo_state_failed.png"
+        }
+      ],
+      "terminal": true
+    }
+  }
+}

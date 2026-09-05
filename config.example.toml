@@ -1,0 +1,28 @@
+[adb]
+# Leave blank to auto-detect bundled ADB, PATH, or a common emulator install.
+path = ""
+device_serial = ""
+
+[connect]
+auto_connect_hosts = ["127.0.0.1"]
+auto_connect_ports = [5555, 5557, 5559, 5561, 5563, 5565]
+
+[paths]
+screenshot_dir = "logs/screenshots"
+debug_dir = "logs/debug"
+template_dir = "assets/templates"
+
+[vision]
+default_timeout_seconds = 8.0
+poll_interval_seconds = 0.35
+click_jitter_pixels = 3
+
+[airtest]
+device_uri = ""
+log_dir = "logs/airtest"
+cap_method = "javacap"
+touch_method = "adb"
+
+[demo.weibo]
+package = "com.sina.weibo"
+launch_wait_seconds = 2.0

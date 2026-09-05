@@ -15,7 +15,16 @@ from .bot import EmulatorBot
 from .vision import Match, match_template
 
 
-SGZZ_PACKAGE = "com.aligames.sgzzlb"
+DEFAULT_SGZZ_CLIENT = "灵犀"
+SGZZ_CLIENT_PACKAGES: dict[str, str] = {
+    "灵犀": "com.aligames.sgzzlb",
+    "小米": "com.aligames.sgzzlb.mi",
+    "九游": "com.uc.game.sgzzlb",
+    "华为": "com.aligames.sgzzlb.huawei",
+    "QQ": "com.tencent.tmgp.s3.sgzzlb",
+}
+SGZZ_CLIENT_TYPES: tuple[str, ...] = tuple(SGZZ_CLIENT_PACKAGES)
+SGZZ_PACKAGE = SGZZ_CLIENT_PACKAGES[DEFAULT_SGZZ_CLIENT]
 OVERLAY_BRIDGE_PACKAGE = "com.example.overlaybridge"
 TEMPLATE_PREFIX = "sgzz"
 DEFAULT_SGZZ_ACCOUNTS_FILE = Path(__file__).resolve().parents[1] / "sgzz_accounts.txt"
@@ -110,6 +119,7 @@ class SGZZAccountCredential:
     account: str
     password: str
     line_number: int
+    client: str = DEFAULT_SGZZ_CLIENT
 
     @property
     def masked_account(self) -> str:
@@ -118,6 +128,10 @@ class SGZZAccountCredential:
     @property
     def account_key(self) -> str:
         return sgzz_account_key(self.account)
+
+    @property
+    def package(self) -> str:
+        return SGZZ_CLIENT_PACKAGES[self.client]
 
 
 def sgzz_account_key(account: str) -> str:
@@ -132,6 +146,65 @@ def mask_sgzz_account(account: str) -> str:
     if len(text) <= 7:
         return f"{text[:2]}***{text[-2:]}"
     return f"{text[:3]}***{text[-4:]}"
+
+
+def normalize_sgzz_client(client: str | None) -> str:
+    value = str(client or "").strip()
+    if not value:
+        return DEFAULT_SGZZ_CLIENT
+    aliases = {
+        "lingxi": "灵犀",
+        "官方": "灵犀",
+        "官服": "灵犀",
+        "xiaomi": "小米",
+        "mi": "小米",
+        "uc": "九游",
+        "9game": "九游",
+        "huawei": "华为",
+        "qq": "QQ",
+        "腾讯": "QQ",
+        "应用宝": "QQ",
+    }
+    normalized = aliases.get(value.lower(), value)
+    if normalized not in SGZZ_CLIENT_PACKAGES:
+        choices = "、".join(SGZZ_CLIENT_TYPES)
+        raise ValueError(f"Unsupported SGZZ client: {value}. Expected one of: {choices}.")
+    return normalized
+
+
+def parse_sgzz_account_credentials_text(text: str) -> list[SGZZAccountCredential]:
+    credentials: list[SGZZAccountCredential] = []
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [part.strip() for part in line.split("#")]
+        if len(parts) not in {2, 3}:
+            raise ValueError(
+                f"Invalid SGZZ account config at line {line_number}: "
+                "expected account#password or account#password#client."
+            )
+        account, password = parts[:2]
+        if not account or not password:
+            raise ValueError(
+                f"Invalid SGZZ account config at line {line_number}: account and password are required."
+            )
+        client = normalize_sgzz_client(parts[2] if len(parts) == 3 else None)
+        credentials.append(
+            SGZZAccountCredential(
+                account=account,
+                password=password,
+                line_number=line_number,
+                client=client,
+            )
+        )
+    if not credentials:
+        raise ValueError("SGZZ account config has no usable accounts.")
+    return credentials
+
+
+def serialize_sgzz_account_credential(credential: SGZZAccountCredential) -> str:
+    return f"{credential.account}#{credential.password}#{credential.client}"
 
 
 def resolve_sgzz_like_target_query_id(value: str | None = None) -> str:
@@ -166,27 +239,12 @@ def load_sgzz_account_credentials(path: str | Path | None = None) -> list[SGZZAc
     if not account_path.exists():
         raise FileNotFoundError(f"SGZZ account config file not found: {account_path}")
 
-    credentials: list[SGZZAccountCredential] = []
-    for line_number, raw_line in enumerate(account_path.read_text(encoding="utf-8").splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "#" not in line:
-            raise ValueError(
-                f"Invalid SGZZ account config at line {line_number}: expected account#password."
-            )
-        account, password = [part.strip() for part in line.split("#", 1)]
-        if not account or not password:
-            raise ValueError(
-                f"Invalid SGZZ account config at line {line_number}: account and password are required."
-            )
-        credentials.append(
-            SGZZAccountCredential(account=account, password=password, line_number=line_number)
-        )
-
-    if not credentials:
-        raise ValueError(f"SGZZ account config has no usable accounts: {account_path}")
-    return credentials
+    try:
+        return parse_sgzz_account_credentials_text(account_path.read_text(encoding="utf-8-sig"))
+    except ValueError as exc:
+        if "has no usable accounts" in str(exc):
+            raise ValueError(f"SGZZ account config has no usable accounts: {account_path}") from exc
+        raise
 
 
 SGZZ_FLOW_NODES: tuple[dict[str, str], ...] = (
@@ -562,6 +620,10 @@ class SGZZStartAccountRunner:
     ) -> None:
         self.bot = bot
         self.package = package
+        self.client_name = next(
+            (name for name, package_name in SGZZ_CLIENT_PACKAGES.items() if package_name == package),
+            DEFAULT_SGZZ_CLIENT,
+        )
         self.coords = coords or SGZZCoordinates()
         self.quick_delay_seconds = quick_delay_seconds
         self.stop_requested = stop_requested
@@ -1476,6 +1538,39 @@ class SGZZStartAccountRunner:
         self.bot.client.launch_package(self.package)
         self._sleep_with_watchdog(wait_seconds, source="launch_game")
         self.screenshot("after_launch")
+
+    def select_account_client(
+        self,
+        credential: SGZZAccountCredential,
+        *,
+        restart_if_changed: bool,
+    ) -> None:
+        previous_client = self.client_name
+        previous_package = self.package
+        self.client_name = credential.client
+        self.package = credential.package
+        changed = previous_package != self.package
+        self._record(
+            {
+                "type": "state",
+                "state": "account_client_selected",
+                "account": credential.masked_account,
+                "account_key": credential.account_key,
+                "client": credential.client,
+                "package": credential.package,
+                "previous_client": previous_client,
+                "previous_package": previous_package,
+                "package_changed": changed,
+            }
+        )
+        if not changed or not restart_if_changed:
+            return
+
+        self.bot.client.force_stop_package(previous_package)
+        self.bot.client.force_stop_package(self.package)
+        self._sleep_with_watchdog(1.0, source="account_client_switch_force_stop")
+        self.launch(wait_seconds=8.0)
+        self.screenshot(f"after_account_client_switch_{credential.client}")
 
     def dismiss_restore_prompt(self) -> None:
         self._record({"type": "state", "state": "dismiss_restore_prompt"})
@@ -7323,6 +7418,8 @@ class SGZZStartAccountRunner:
                 "state": "login_account_with_password",
                 "line_number": credential.line_number,
                 "account": credential.masked_account,
+                "client": credential.client,
+                "package": credential.package,
                 "process_current_role_before_switch": process_current_role_before_switch,
                 "include_gacha": include_gacha,
                 "include_gamecircle_signin": include_gamecircle_signin,
@@ -7394,6 +7491,38 @@ class SGZZStartAccountRunner:
                 f"Account batch flow could not reach role-select entry after login: {credential.masked_account}."
             )
         return self.screenshot("after_account_password_login")
+
+    def login_configured_account(
+        self,
+        credential: SGZZAccountCredential,
+        *,
+        process_current_role_before_switch: bool = False,
+        include_gacha: bool = True,
+        include_gamecircle_signin: bool = False,
+    ) -> Path:
+        if credential.client != DEFAULT_SGZZ_CLIENT:
+            path = self.screenshot(f"{credential.client}_client_login_flow_pending")
+            self._record(
+                {
+                    "type": "state",
+                    "state": "account_client_login_flow_pending",
+                    "account": credential.masked_account,
+                    "account_key": credential.account_key,
+                    "client": credential.client,
+                    "package": credential.package,
+                    "screenshot": str(path),
+                }
+            )
+            raise RuntimeError(
+                f"{credential.client} client was launched ({credential.package}), "
+                "but its login flow has not been recorded yet."
+            )
+        return self.login_account_with_password(
+            credential,
+            process_current_role_before_switch=process_current_role_before_switch,
+            include_gacha=include_gacha,
+            include_gamecircle_signin=include_gamecircle_signin,
+        )
 
     def _detect_account_role_select_entry_marker(
         self,
@@ -8613,6 +8742,8 @@ class SGZZStartAccountRunner:
                 "account_count": account_count,
                 "line_number": credential.line_number,
                 "account": credential.masked_account,
+                "client": credential.client,
+                "package": credential.package,
                 "max_cycles": max_cycles,
                 "include_gacha": include_gacha,
                 "include_gamecircle_signin": include_gamecircle_signin,
@@ -8620,7 +8751,7 @@ class SGZZStartAccountRunner:
             }
         )
         self._watchdog_reset()
-        self.login_account_with_password(
+        self.login_configured_account(
             credential,
             process_current_role_before_switch=process_current_role_before_switch,
             include_gacha=include_gacha,
@@ -8633,6 +8764,8 @@ class SGZZStartAccountRunner:
                 "index": account_index,
                 "account_count": account_count,
                 "account": credential.masked_account,
+                "client": credential.client,
+                "package": credential.package,
             }
         )
 
@@ -8649,6 +8782,8 @@ class SGZZStartAccountRunner:
                 "index": account_index,
                 "account_count": account_count,
                 "account": credential.masked_account,
+                "client": credential.client,
+                "package": credential.package,
                 "record_path": str(account_done_path),
                 **account_cycle_summary,
             }
@@ -8669,6 +8804,7 @@ class SGZZStartAccountRunner:
 
         account_path = resolve_sgzz_accounts_file(accounts_file)
         credentials = load_sgzz_account_credentials(account_path)
+        self.select_account_client(credentials[0], restart_if_changed=False)
         process_bootstrap_current_role = os.environ.get(
             "SGZZ_PROCESS_BOOTSTRAP_CURRENT_ROLE",
             "0",
@@ -8683,7 +8819,14 @@ class SGZZStartAccountRunner:
                 "include_gacha": include_gacha,
                 "include_gamecircle_signin": include_gamecircle_signin,
                 "process_bootstrap_current_role": process_bootstrap_current_role,
-                "accounts": [credential.masked_account for credential in credentials],
+                "accounts": [
+                    {
+                        "account": credential.masked_account,
+                        "client": credential.client,
+                        "package": credential.package,
+                    }
+                    for credential in credentials
+                ],
                 "strategy": "bootstrap_current_role_then_config_order_login_each_account_all_roles",
             }
         )
@@ -8691,6 +8834,7 @@ class SGZZStartAccountRunner:
             {
                 "type": "state",
                 "state": "account_batch_initial_restart",
+                "client": self.client_name,
                 "package": self.package,
             }
         )
@@ -8703,6 +8847,7 @@ class SGZZStartAccountRunner:
         previous_seed = os.environ.pop("SGZZ_ROLE_IDENTITY_SEED_RUN_DIR", None)
         try:
             for index, credential in enumerate(credentials, start=1):
+                self.select_account_client(credential, restart_if_changed=True)
                 for attempt in range(1, self._watchdog_restart_limit + 2):
                     os.environ.pop("SGZZ_ROLE_IDENTITY_PROCESSED_OFFSET", None)
                     os.environ.pop("SGZZ_ROLE_IDENTITY_SEED_RUN_DIR", None)
@@ -8715,6 +8860,8 @@ class SGZZStartAccountRunner:
                             "line_number": credential.line_number,
                             "account": credential.masked_account,
                             "account_key": credential.account_key,
+                            "client": credential.client,
+                            "package": credential.package,
                             "attempt": attempt,
                         }
                     )
@@ -8757,6 +8904,8 @@ class SGZZStartAccountRunner:
                             "account": credential.masked_account,
                             "account_key": credential.account_key,
                             "line_number": credential.line_number,
+                            "client": credential.client,
+                            "package": credential.package,
                             "record_path": str(account_done_path),
                             **self._last_account_cycle_summary,
                         }
@@ -8775,25 +8924,41 @@ class SGZZStartAccountRunner:
                                 "next_account": next_credential.masked_account,
                                 "next_account_key": next_credential.account_key,
                                 "next_line_number": next_credential.line_number,
+                                "next_client": next_credential.client,
+                                "next_package": next_credential.package,
                             }
                         )
                         self._watchdog_reset()
-                        try:
-                            self.open_account_login_modal_for_switch(
-                                include_gacha=include_gacha,
-                                include_gamecircle_signin=include_gamecircle_signin,
-                            )
-                        except SGZZScreenStuckRestart as exc:
+                        if next_credential.package == credential.package:
+                            try:
+                                self.open_account_login_modal_for_switch(
+                                    include_gacha=include_gacha,
+                                    include_gamecircle_signin=include_gamecircle_signin,
+                                )
+                            except SGZZScreenStuckRestart as exc:
+                                self._record(
+                                    {
+                                        "type": "state",
+                                        "state": "account_batch_prepare_next_retry_after_stuck",
+                                        "finished_index": index,
+                                        "next_index": index + 1,
+                                        "next_account": next_credential.masked_account,
+                                        "next_account_key": next_credential.account_key,
+                                        "restart_count": self._watchdog_restarts,
+                                        "error": str(exc),
+                                    }
+                                )
+                        else:
                             self._record(
                                 {
                                     "type": "state",
-                                    "state": "account_batch_prepare_next_retry_after_stuck",
+                                    "state": "account_batch_prepare_next_client_switch",
                                     "finished_index": index,
                                     "next_index": index + 1,
                                     "next_account": next_credential.masked_account,
                                     "next_account_key": next_credential.account_key,
-                                    "restart_count": self._watchdog_restarts,
-                                    "error": str(exc),
+                                    "next_client": next_credential.client,
+                                    "next_package": next_credential.package,
                                 }
                             )
                         self._record(
@@ -8804,6 +8969,8 @@ class SGZZStartAccountRunner:
                                 "account_count": len(credentials),
                                 "next_account": next_credential.masked_account,
                                 "next_account_key": next_credential.account_key,
+                                "next_client": next_credential.client,
+                                "next_package": next_credential.package,
                             }
                         )
                     break
@@ -8823,7 +8990,14 @@ class SGZZStartAccountRunner:
                 "type": "state",
                 "state": "account_batch_remaining_roles_daily_cycle_done",
                 "account_count": len(credentials),
-                "accounts": [credential.masked_account for credential in credentials],
+                "accounts": [
+                    {
+                        "account": credential.masked_account,
+                        "client": credential.client,
+                        "package": credential.package,
+                    }
+                    for credential in credentials
+                ],
             }
         )
         return self.screenshot("after_account_batch_remaining_roles_daily_cycle")

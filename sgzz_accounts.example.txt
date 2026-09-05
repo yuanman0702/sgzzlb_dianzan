@@ -1,0 +1,3 @@
+# One private account per line: account#password#client
+# Supported clients: 灵犀, 小米, 九游, 华为, QQ
+13800000000#replace-with-password#灵犀

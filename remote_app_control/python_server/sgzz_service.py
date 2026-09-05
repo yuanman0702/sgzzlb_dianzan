@@ -7,7 +7,7 @@ import sys
 import threading
 import traceback
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from time import sleep, time
@@ -24,14 +24,17 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from emulator_bot.sgzz import (  # noqa: E402
+    SGZZ_CLIENT_PACKAGES,
+    SGZZ_CLIENT_TYPES,
     SGZZ_FLOW_NODES,
     SGZZ_PACKAGE,
     SGZZStartAccountRunner,
     SGZZStopRequested,
     load_sgzz_account_credentials,
-    mask_sgzz_account,
+    normalize_sgzz_client,
+    parse_sgzz_account_credentials_text,
     resolve_sgzz_accounts_file,
-    sgzz_account_key,
+    serialize_sgzz_account_credential,
 )
 from emulator_bot.vision import match_template  # noqa: E402
 
@@ -388,7 +391,10 @@ def format_sgzz_progress_event(event: dict[str, object]) -> str | None:
             (
                 "node",
                 "source",
+                "client",
                 "package",
+                "next_client",
+                "next_package",
                 "path",
                 "include_gacha",
                 "include_gamecircle_signin",
@@ -575,32 +581,19 @@ def build_sgzz_runner(
 
 
 def parse_sgzz_accounts_text(text: str) -> list[dict[str, Any]]:
-    accounts: list[dict[str, Any]] = []
-    for line_number, raw_line in enumerate(text.splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "#" not in line:
-            raise ValueError(
-                f"Invalid SGZZ account config at line {line_number}: expected account#password."
-            )
-        account, password = [part.strip() for part in line.split("#", 1)]
-        if not account or not password:
-            raise ValueError(
-                f"Invalid SGZZ account config at line {line_number}: account and password are required."
-            )
-        accounts.append(
-            {
-                "line_number": line_number,
-                "account": account,
-                "account_key": sgzz_account_key(account),
-                "masked_account": mask_sgzz_account(account),
-                "password_length": len(password),
-            }
-        )
-    if not accounts:
-        raise ValueError("SGZZ account config has no usable accounts.")
-    return accounts
+    credentials = parse_sgzz_account_credentials_text(text)
+    return [
+        {
+            "line_number": credential.line_number,
+            "account": credential.account,
+            "account_key": credential.account_key,
+            "masked_account": credential.masked_account,
+            "password_length": len(credential.password),
+            "client": credential.client,
+            "package": credential.package,
+        }
+        for credential in credentials
+    ]
 
 
 def today_key() -> str:
@@ -716,7 +709,7 @@ def write_selected_accounts_file(
     path = SGZZ_SELECTED_ACCOUNTS_DIR / (
         f"sgzz_selected_accounts_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{int(time() * 1000)}.txt"
     )
-    text = "".join(f"{credential.account}#{credential.password}\n" for credential in picked)
+    text = "".join(f"{serialize_sgzz_account_credential(credential)}\n" for credential in picked)
     path.write_text(text, encoding="utf-8")
     return {
         "path": str(path),
@@ -726,6 +719,8 @@ def write_selected_accounts_file(
                 "line_number": credential.line_number,
                 "account_key": credential.account_key,
                 "masked_account": credential.masked_account,
+                "client": credential.client,
+                "package": credential.package,
             }
             for credential in picked
         ],
@@ -734,7 +729,7 @@ def write_selected_accounts_file(
 
 def read_accounts_config(accounts_file: str | None = None) -> dict[str, Any]:
     account_path = resolve_sgzz_accounts_file(accounts_file)
-    text = account_path.read_text(encoding="utf-8") if account_path.exists() else ""
+    text = account_path.read_text(encoding="utf-8-sig") if account_path.exists() else ""
     accounts = parse_sgzz_accounts_text(text) if text.strip() else []
     like_status = read_account_like_status()
     liked = like_status["liked"]
@@ -751,6 +746,8 @@ def read_accounts_config(accounts_file: str | None = None) -> dict[str, Any]:
         "accounts_text": text,
         "account_count": len(accounts),
         "accounts": accounts,
+        "client_types": list(SGZZ_CLIENT_TYPES),
+        "client_packages": dict(SGZZ_CLIENT_PACKAGES),
         "like_date": like_status["date"],
         "like_status_path": like_status["status_path"],
     }
@@ -770,11 +767,42 @@ def pending_account_keys_for_today(accounts_file: str | None = None) -> dict[str
 
 
 def write_accounts_config(accounts_text: str, accounts_file: str | None = None) -> dict[str, Any]:
-    accounts = parse_sgzz_accounts_text(accounts_text)
+    parse_sgzz_accounts_text(accounts_text)
     account_path = resolve_sgzz_accounts_file(accounts_file)
     account_path.parent.mkdir(parents=True, exist_ok=True)
     normalized = accounts_text.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
     account_path.write_text(normalized, encoding="utf-8")
+    return read_accounts_config(str(account_path))
+
+
+def set_account_client(
+    account_key: str,
+    client: str,
+    accounts_file: str | None = None,
+) -> dict[str, Any]:
+    key = str(account_key or "").strip()
+    if not key:
+        raise ValueError("account_key is required")
+    normalized_client = normalize_sgzz_client(client)
+    account_path = resolve_sgzz_accounts_file(accounts_file)
+    if not account_path.exists():
+        raise FileNotFoundError(f"SGZZ account config file not found: {account_path}")
+
+    text = account_path.read_text(encoding="utf-8-sig")
+    credentials = parse_sgzz_account_credentials_text(text)
+    lines = text.splitlines()
+    matched = False
+    for credential in credentials:
+        if credential.account_key != key:
+            continue
+        lines[credential.line_number - 1] = serialize_sgzz_account_credential(
+            replace(credential, client=normalized_client)
+        )
+        matched = True
+    if not matched:
+        raise ValueError("Selected SGZZ account was not found in the account file.")
+
+    account_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     return read_accounts_config(str(account_path))
 
 

@@ -54,9 +54,12 @@ numpy
 首次运行前，在仓库根目录创建两个仅保存在本机的文件：
 
 ```text
-sgzz_accounts.txt      每行填写 账号#密码
+sgzz_accounts.txt      每行填写 账号#密码#客户端
 sgzz_like_target.txt   填写目标玩家编号
 ```
+
+客户端可填 `灵犀`、`小米`、`九游`、`华为`、`QQ`。第三列省略时默认使用
+`灵犀`，也可以直接在服务端账号表格的“客户端”列下拉修改。
 
 这两个文件及 `config.toml`、日志和打包目录均已加入 `.gitignore`，不会提交到 Git。
 
@@ -92,6 +95,8 @@ curl -X POST http://127.0.0.1:8766/sgzz/start-game -H "Content-Type: application
 curl -X POST http://127.0.0.1:8766/sgzz/run-node -H "Content-Type: application/json" -d "{\"device_id\":\"emulator-5554\",\"node\":\"daily_signin_like_gacha\"}"
 curl -X POST http://127.0.0.1:8766/sgzz/run-account-batch -H "Content-Type: application/json" -d "{\"device_id\":\"emulator-5554\",\"max_cycles_per_account\":80,\"include_gacha\":true}"
 curl -X POST http://127.0.0.1:8766/sgzz/stop -H "Content-Type: application/json" -d "{\"device_id\":\"emulator-5554\"}"
+curl -X POST http://127.0.0.1:8766/sgzz/accounts/set-client -H "Content-Type: application/json" -d "{\"account_key\":\"账号键\",\"client\":\"小米\"}"
 ```
 
-账号文件默认仍使用仓库根目录的 `sgzz_accounts.txt`。
+账号文件默认仍使用仓库根目录的 `sgzz_accounts.txt`。非灵犀客户端在安装后
+需要分别录制登录流程；录制完成前，程序只会启动对应客户端并明确提示登录流程待配置。

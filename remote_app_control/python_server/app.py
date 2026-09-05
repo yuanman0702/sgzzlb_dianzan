@@ -14,6 +14,7 @@ from sgzz_service import (
     detect_sgzz_from_device,
     read_account_like_status,
     read_accounts_config,
+    set_account_client,
     set_account_liked_today,
     write_accounts_config,
 )
@@ -205,6 +206,23 @@ def sgzz_save_accounts() -> Any:
     accounts_text = str(payload.get("accounts_text") or "")
     try:
         return jsonify({"ok": True, "config": write_accounts_config(accounts_text, accounts_file)})
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+
+@app.post("/sgzz/accounts/set-client")
+def sgzz_set_account_client() -> Any:
+    payload = request.get_json(silent=True) or {}
+    accounts_file = str(payload.get("accounts_file") or "").strip() or None
+    account_key = str(payload.get("account_key") or "").strip()
+    client = str(payload.get("client") or "").strip()
+    try:
+        return jsonify(
+            {
+                "ok": True,
+                "config": set_account_client(account_key, client, accounts_file),
+            }
+        )
     except Exception as exc:  # noqa: BLE001
         return jsonify({"ok": False, "error": str(exc)}), 400
 

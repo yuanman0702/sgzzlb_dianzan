@@ -161,9 +161,11 @@ templates to recognize title buttons, the server selector, Season 1, and queue
 popups, then falls back to recorded coordinates when a template is not visible.
 
 For multi-account daily runs, put one account per line in `sgzz_accounts.txt`
-using `account#password`. `sgzz-account-batch` logs into each account in order,
-runs every remaining role until the repeated role identity stop condition is
-hit, then switches to the next account. The script stops after the last account.
+using `account#password#client`. Supported client names are `灵犀`, `小米`,
+`九游`, `华为`, and `QQ`. The client field is optional and defaults to `灵犀`,
+so existing `account#password` files remain valid. `sgzz-account-batch` logs
+into each account in order, runs every remaining role until the repeated role
+identity stop condition is hit, then switches to the next account.
 
 Put the target player's numeric ID in `sgzz_like_target.txt`. The runner uses it
 to send a friend request when a role does not yet have the configured like target.

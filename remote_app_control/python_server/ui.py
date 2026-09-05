@@ -23,9 +23,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from sgzz_service import (
+    SGZZ_CLIENT_TYPES,
     clear_account_like_status,
     detect_sgzz_from_device,
     read_accounts_config,
+    set_account_client,
     set_account_liked_today,
 )
 
@@ -126,6 +128,7 @@ class ControlPanel:
         self.account_rows: dict[str, dict[str, Any]] = {}
         self.account_row_keys: dict[str, str] = {}
         self.account_selected_by_key: dict[str, bool] = {}
+        self.account_client_editor: ttk.Combobox | None = None
         self.accounts_last_error = ""
         self.simplified_mode = False
         self.normal_geometry = "1160x760"
@@ -244,7 +247,7 @@ class ControlPanel:
 
         account_table = ttk.Frame(accounts)
         account_table.pack(fill=BOTH, expand=True, padx=8, pady=(0, 8))
-        account_columns = ("selected", "liked", "line", "account", "password")
+        account_columns = ("selected", "liked", "line", "client", "account", "password")
         self.accounts_tree = ttk.Treeview(
             account_table,
             columns=account_columns,
@@ -255,12 +258,14 @@ class ControlPanel:
         self.accounts_tree.heading("selected", text="选择")
         self.accounts_tree.heading("liked", text="点赞")
         self.accounts_tree.heading("line", text="行号")
+        self.accounts_tree.heading("client", text="客户端")
         self.accounts_tree.heading("account", text="账号")
         self.accounts_tree.heading("password", text="密码")
         self.accounts_tree.column("selected", width=44, minwidth=38, anchor="center", stretch=False)
         self.accounts_tree.column("liked", width=44, minwidth=38, anchor="center", stretch=False)
         self.accounts_tree.column("line", width=42, minwidth=34, anchor="center", stretch=False)
-        self.accounts_tree.column("account", width=145, minwidth=110, anchor="w", stretch=True)
+        self.accounts_tree.column("client", width=62, minwidth=54, anchor="center", stretch=False)
+        self.accounts_tree.column("account", width=112, minwidth=92, anchor="w", stretch=True)
         self.accounts_tree.column("password", width=42, minwidth=34, anchor="center", stretch=False)
         self.accounts_tree.pack(side=LEFT, fill=BOTH, expand=True)
         accounts_scrollbar = ttk.Scrollbar(
@@ -699,7 +704,7 @@ class ControlPanel:
     def checkbox_text(value: bool) -> str:
         return "[√]" if value else "[ ]"
 
-    def account_values(self, row_id: str) -> tuple[str, str, str, str, str]:
+    def account_values(self, row_id: str) -> tuple[str, str, str, str, str, str]:
         account = self.account_rows.get(row_id, {})
         key = self.account_row_keys.get(row_id, "")
         selected = self.account_selected_by_key.get(key, True)
@@ -710,6 +715,7 @@ class ControlPanel:
             self.checkbox_text(selected),
             self.checkbox_text(liked),
             str(account.get("line_number") or ""),
+            str(account.get("client") or "灵犀"),
             str(account.get("masked_account") or account.get("account") or ""),
             password_text,
         )
@@ -806,7 +812,76 @@ class ControlPanel:
         if column == "#2":
             self.toggle_account_liked(str(row_id))
             return "break"
+        if column == "#4":
+            self.open_account_client_editor(str(row_id))
+            return "break"
+        self.close_account_client_editor()
         return None
+
+    def close_account_client_editor(self, editor: ttk.Combobox | None = None) -> None:
+        if editor is not None and editor is not self.account_client_editor:
+            return
+        current = self.account_client_editor
+        self.account_client_editor = None
+        if current is not None:
+            current.destroy()
+
+    def open_account_client_editor(self, row_id: str) -> None:
+        account = self.account_rows.get(row_id)
+        if not account:
+            return
+        bounds = self.accounts_tree.bbox(row_id, "client")
+        if not bounds:
+            return
+        self.close_account_client_editor()
+        x, y, width, height = bounds
+        editor = ttk.Combobox(
+            self.accounts_tree,
+            values=SGZZ_CLIENT_TYPES,
+            state="readonly",
+            justify="center",
+        )
+        editor.set(str(account.get("client") or "灵犀"))
+        editor.place(x=x, y=y, width=width, height=height)
+        self.account_client_editor = editor
+        editor.bind(
+            "<<ComboboxSelected>>",
+            lambda _event, target=row_id, widget=editor: self.save_account_client(
+                target,
+                widget.get(),
+            ),
+        )
+        editor.bind("<Escape>", lambda _event, widget=editor: self.close_account_client_editor(widget))
+        editor.bind(
+            "<FocusOut>",
+            lambda _event, widget=editor: self.root.after(
+                100,
+                lambda: self.close_account_client_editor(widget),
+            ),
+        )
+        editor.focus_set()
+
+    def save_account_client(self, row_id: str, client: str) -> None:
+        account = self.account_rows.get(row_id)
+        key = self.account_row_keys.get(row_id)
+        if not account or not key:
+            self.close_account_client_editor()
+            return
+        current_client = str(account.get("client") or "灵犀")
+        if client == current_client:
+            self.close_account_client_editor()
+            return
+        masked_account = str(account.get("masked_account") or account.get("account") or "")
+        try:
+            config = set_account_client(key, client, self.accounts_file_value())
+            self.accounts_file.set(str(config["path"]))
+            self.set_account_rows(config)
+            self.log(f"账号客户端已更新: {masked_account} -> {client}")
+        except Exception as exc:  # noqa: BLE001
+            self.log_error("更新账号客户端失败", exc)
+            messagebox.showerror("更新失败", str(exc))
+        finally:
+            self.close_account_client_editor()
 
     def on_account_tree_space(self, _event: object) -> str | None:
         row_id = str(self.accounts_tree.focus() or "")

@@ -7715,7 +7715,26 @@ class SGZZStartAccountRunner:
                     "package": credential.package,
                 }
             )
-            role_marker_key, role_marker = self.wait_for_account_role_select_entry(timeout_seconds=90.0)
+            end_at = time() + 90.0
+            role_marker_key: str | None = None
+            role_marker: Match | None = None
+            while time() < end_at:
+                role_marker_key, role_marker = self.wait_for_account_role_select_entry(timeout_seconds=6.0)
+                if role_marker:
+                    break
+                if self.detect_like_main_screen():
+                    self._record(
+                        {
+                            "type": "vision_feature",
+                            "feature": "xiaomi_cached_login_main_screen",
+                            "present": True,
+                            "account": credential.masked_account,
+                            "source": "main_screen_detected",
+                        }
+                    )
+                    return self.screenshot("after_xiaomi_cached_login_main_screen")
+                self.handle_entry_preconditions(max_rounds=2)
+
             self._record(
                 {
                     "type": "vision_feature",
@@ -7731,10 +7750,21 @@ class SGZZStartAccountRunner:
                 }
             )
             if not role_marker:
+                if self.detect_like_main_screen():
+                    self._record(
+                        {
+                            "type": "vision_feature",
+                            "feature": "xiaomi_cached_login_main_screen",
+                            "present": True,
+                            "account": credential.masked_account,
+                            "source": "final_main_screen_detected",
+                        }
+                    )
+                    return self.screenshot("after_xiaomi_cached_login_main_screen")
                 path = self.screenshot("xiaomi_cached_login_role_select_not_found")
                 raise RuntimeError(
-                    f"Xiaomi cached login did not reach the role-select entry: {credential.masked_account}. "
-                    f"Check the emulator login page in {path}."
+                    f"Xiaomi cached login did not reach the role-select entry or main screen: "
+                    f"{credential.masked_account}. Check the emulator login page in {path}."
                 )
             return self.screenshot("after_xiaomi_cached_login")
 
@@ -8533,19 +8563,61 @@ class SGZZStartAccountRunner:
                 )
                 self.screenshot("daily_like_missing_friend_request_failed")
             self.close_friend_query_add_modal_if_present(timeout_seconds=0.8)
-            try:
-                self.click_friends_back_button_for_like()
-            except RuntimeError as back_exc:
-                self._record(
-                    {
-                        "type": "state",
-                        "state": "daily_like_target_missing_back_retry",
-                        "error": str(back_exc),
-                    }
-                )
-                self.click_any_visible_back_if_present(timeout_seconds=0.6)
-            if not self.detect_like_main_screen():
-                self.recover_to_main_screen(max_steps=6)
+            retried_like_after_request = False
+            if request_sent:
+                try:
+                    try:
+                        self.click_friends_back_button_for_like()
+                    except RuntimeError as back_exc:
+                        self._record(
+                            {
+                                "type": "state",
+                                "state": "daily_like_target_missing_back_retry_before_reopen",
+                                "error": str(back_exc),
+                            }
+                        )
+                        self.click_any_visible_back_if_present(timeout_seconds=0.6)
+                    if not self.detect_like_main_screen():
+                        self.recover_to_main_screen(max_steps=6)
+                    self.open_friends_list_for_like()
+                    self.click_dabai_friend_button_for_like()
+                    self.click_personal_info_button_for_like()
+                    self.click_personal_home_view_button_for_like()
+                    self.click_home_like_button_for_like(clicks=5)
+                    self.click_home_back_button_for_like()
+                    self.click_friends_back_button_for_like()
+                    self.close_exit_confirm_if_present(timeout_seconds=self._fast_timeout(0.5, 0.20))
+                    like_done = True
+                    retried_like_after_request = True
+                    self._record(
+                        {
+                            "type": "state",
+                            "state": "daily_like_missing_friend_retry_done",
+                        }
+                    )
+                except RuntimeError as retry_exc:
+                    self._record(
+                        {
+                            "type": "state",
+                            "state": "daily_like_missing_friend_retry_failed",
+                            "error": str(retry_exc),
+                        }
+                    )
+                    self.screenshot("daily_like_missing_friend_retry_failed")
+            if not retried_like_after_request:
+                try:
+                    self.click_friends_back_button_for_like()
+                except RuntimeError as back_exc:
+                    self._record(
+                        {
+                            "type": "state",
+                            "state": "daily_like_target_missing_back_retry",
+                            "error": str(back_exc),
+                        }
+                    )
+                    self.click_any_visible_back_if_present(timeout_seconds=0.6)
+                if not self.detect_like_main_screen():
+                    self.recover_to_main_screen(max_steps=6)
         self._record(
             {
                 "type": "vision_feature",
@@ -8698,6 +8770,7 @@ class SGZZStartAccountRunner:
         first_ingame_template: np.ndarray | None = None
         unavailable_role_fingerprints: set[str] = set()
         unavailable_role_templates: list[np.ndarray] = []
+        processed_role_templates: list[np.ndarray] = []
         processed_offset = int(os.environ.get("SGZZ_ROLE_IDENTITY_PROCESSED_OFFSET", "0"))
         processed_cycles = processed_offset
         daily_like_done_count = 0
@@ -8793,6 +8866,7 @@ class SGZZStartAccountRunner:
                     str,
                 ] | None = None
                 skipped_unavailable_rows = 0
+                skipped_processed_rows = 0
                 for candidate_row in reversed(rows):
                     candidate_region = self.server_selector_role_identity_region(
                         candidate_row,
@@ -8831,6 +8905,26 @@ class SGZZStartAccountRunner:
                             }
                         )
                         continue
+                    processed_similarity = max(
+                        (
+                            self._template_similarity(candidate_crop, processed_template)
+                            for processed_template in processed_role_templates
+                        ),
+                        default=0.0,
+                    )
+                    if processed_similarity >= 0.97:
+                        skipped_processed_rows += 1
+                        self._record(
+                            {
+                                "type": "vision_feature",
+                                "feature": "account_remaining_processed_role_row_skipped",
+                                "iteration": cycle,
+                                "row_y": int(candidate_row["y"]),
+                                "tap_y": int(candidate_row["tap_y"]),
+                                "row_similarity": round(processed_similarity, 4),
+                            }
+                        )
+                        continue
                     selected_row = (
                         candidate_row,
                         candidate_region,
@@ -8843,16 +8937,17 @@ class SGZZStartAccountRunner:
                     self._record(
                         {
                             "type": "state",
-                            "state": "account_remaining_roles_only_unavailable_stop",
+                            "state": "account_remaining_roles_all_classified_stop",
                             "iteration": cycle,
                             "processed_cycles": processed_cycles,
                             "role_row_count": len(rows),
                             "skipped_unavailable_rows": skipped_unavailable_rows,
+                            "skipped_processed_rows": skipped_processed_rows,
                         }
                     )
                     self._watchdog_reset()
-                    self.screenshot("account_remaining_roles_only_unavailable_stop")
-                    completion_reason = "only_unavailable_roles"
+                    self.screenshot("account_remaining_roles_all_classified_stop")
+                    completion_reason = "all_roles_classified"
                     break
 
                 last_row, row_identity_region, row_identity_crop, last_fingerprint = selected_row
@@ -8893,6 +8988,7 @@ class SGZZStartAccountRunner:
                         "row_identity_score": round(row_identity_score, 4),
                         "row_repeat_candidate": row_repeat_candidate,
                         "skipped_unavailable_rows": skipped_unavailable_rows,
+                        "skipped_processed_rows": skipped_processed_rows,
                     }
                 )
 
@@ -9079,6 +9175,24 @@ class SGZZStartAccountRunner:
                     include_gacha=include_gacha,
                     include_gamecircle_signin=include_gamecircle_signin,
                 )
+                if not self._last_daily_like_done:
+                    self._record(
+                        {
+                            "type": "state",
+                            "state": "account_remaining_role_flow_incomplete_not_marked",
+                            "iteration": cycle,
+                            "processed_cycles": processed_cycles,
+                            "daily_like_done_count": daily_like_done_count,
+                            "like_limit_reached": self._last_like_limit_reached,
+                            "reason": "daily_like_not_completed",
+                            "row_identity_path": str(row_identity_path),
+                        }
+                    )
+                    self._watchdog_reset()
+                    self.screenshot("account_remaining_role_flow_incomplete_not_marked")
+                    completion_reason = "role_flow_incomplete"
+                    break
+                processed_role_templates.append(row_identity_crop.copy())
                 processed_cycles += 1
                 if self._last_daily_like_done:
                     daily_like_done_count += 1
@@ -9098,23 +9212,6 @@ class SGZZStartAccountRunner:
                             "like_limit_stop_threshold": like_limit_stop_threshold,
                     }
                 )
-                if like_limit_consecutive_count >= like_limit_stop_threshold:
-                    self._record(
-                        {
-                            "type": "state",
-                            "state": "account_remaining_roles_like_limit_stop",
-                            "processed_cycles": processed_cycles,
-                            "daily_like_done_count": daily_like_done_count,
-                            "iteration": cycle,
-                            "like_limit_consecutive_count": like_limit_consecutive_count,
-                            "like_limit_stop_threshold": like_limit_stop_threshold,
-                        }
-                    )
-                    self._watchdog_reset()
-                    self.screenshot("account_remaining_roles_like_limit_stop")
-                    like_limit_stop_reached = True
-                    completion_reason = "like_limit_stop"
-                    break
                 cycle += 1
             except SGZZScreenStuckRestart as exc:
                 self._record(
@@ -9139,7 +9236,9 @@ class SGZZStartAccountRunner:
 
         processed_this_run = max(0, processed_cycles - processed_offset)
         account_like_completed = processed_cycles > 0 and (
-            daily_like_done_count >= processed_this_run or like_limit_stop_reached
+            processed_this_run > 0
+            and completion_reason in {"all_roles_classified", "no_visible_or_hidden_roles"}
+            and daily_like_done_count >= processed_this_run
         )
         self._last_account_cycle_summary = {
             "processed_cycles": processed_cycles,

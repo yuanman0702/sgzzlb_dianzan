@@ -8,6 +8,8 @@ from time import sleep, time
 import hashlib
 import json
 import os
+import re
+import xml.etree.ElementTree as ET
 import cv2
 import numpy as np
 
@@ -97,6 +99,10 @@ TEMPLATES = {
     "account_switch_account_button": f"{TEMPLATE_PREFIX}/account_switch_account_button.png",
     "account_login_modal_logo": f"{TEMPLATE_PREFIX}/account_login_modal_logo.png",
     "account_login_button": f"{TEMPLATE_PREFIX}/account_login_button.png",
+    "xiaomi_quick_login_decline_button": f"{TEMPLATE_PREFIX}/xiaomi_quick_login_decline_button.png",
+    "xiaomi_graphics_settings_save_button": f"{TEMPLATE_PREFIX}/xiaomi_graphics_settings_save_button.png",
+    "xiaomi_missing_resources_confirm_button": f"{TEMPLATE_PREFIX}/xiaomi_missing_resources_confirm_button.png",
+    "xiaomi_background_resources_confirm_button": f"{TEMPLATE_PREFIX}/xiaomi_background_resources_confirm_button.png",
     "enter_world_again_button": f"{TEMPLATE_PREFIX}/enter_world_again_button.png",
     "role_enter_battle_button": f"{TEMPLATE_PREFIX}/role_enter_battle_button.png",
     "region_select_title_top": f"{TEMPLATE_PREFIX}/region_select_title_top.png",
@@ -127,16 +133,19 @@ class SGZZAccountCredential:
 
     @property
     def account_key(self) -> str:
-        return sgzz_account_key(self.account)
+        return sgzz_account_key(self.account, self.client)
 
     @property
     def package(self) -> str:
         return SGZZ_CLIENT_PACKAGES[self.client]
 
 
-def sgzz_account_key(account: str) -> str:
+def sgzz_account_key(account: str, client: str | None = None) -> str:
     text = str(account).strip()
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    normalized_client = normalize_sgzz_client(client)
+    # Keep existing Lingxi keys stable so today's completion state survives the migration.
+    identity = text if normalized_client == DEFAULT_SGZZ_CLIENT else f"{normalized_client}\0{text}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
 
 def mask_sgzz_account(account: str) -> str:
@@ -632,6 +641,7 @@ class SGZZStartAccountRunner:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.record_path = self.run_dir / "steps.jsonl"
         self._step_index = 0
+        self._xiaomi_login_ui_state: str | None = None
         self._watchdog_enabled = os.environ.get("SGZZ_STUCK_WATCHDOG", "1").lower() not in {
             "0",
             "false",
@@ -2093,7 +2103,9 @@ class SGZZStartAccountRunner:
     @staticmethod
     def ingame_role_identity_region(image: np.ndarray) -> tuple[int, int, int, int]:
         h, w = image.shape[:2]
-        return int(w * 0.12), int(h * 0.045), int(w * 0.40), int(h * 0.085)
+        # Match the role-name line only. The old crop included the avatar, resource
+        # counters and fixed title suffix, which made different new roles look alike.
+        return int(w * 0.12), int(h * 0.098), int(w * 0.29), int(h * 0.032)
 
     def compare_role_identity_crop(
         self,
@@ -3210,6 +3222,141 @@ class SGZZStartAccountRunner:
         self.screenshot("after_close_notice_ack")
         return True
 
+    def close_xiaomi_quick_login_prompt_if_present(self, *, timeout_seconds: float = 0.8) -> bool:
+        if self.client_name != "小米":
+            return False
+        image = self.bot.screenshot_image()
+        h, w = image.shape[:2]
+        if w >= h:
+            return False
+        match = self.wait_for_template(
+            "小米客户端-快速登录提示-暂不开启",
+            "xiaomi_quick_login_decline_button",
+            timeout_seconds=timeout_seconds,
+            threshold=0.92,
+            region=(int(w * 0.48), int(h * 0.52), int(w * 0.30), int(h * 0.14)),
+        )
+        self._record(
+            {
+                "type": "vision_feature",
+                "feature": "xiaomi_quick_login_prompt",
+                "present": match is not None,
+                "x": match.x if match else None,
+                "y": match.y if match else None,
+                "width": match.width if match else None,
+                "height": match.height if match else None,
+                "score": round(match.score, 4) if match else 0.0,
+            }
+        )
+        if not match:
+            return False
+        self._save_image_snapshot("before_close_xiaomi_quick_login_prompt", image)
+        self.tap("小米客户端-快速登录提示-暂不开启", Point(*match.center), wait_seconds=3.0)
+        self._watchdog_reset()
+        self.screenshot("after_close_xiaomi_quick_login_prompt")
+        return True
+
+    def confirm_xiaomi_missing_resources_if_present(self, *, timeout_seconds: float = 0.8) -> bool:
+        if self.client_name != "小米":
+            return False
+        image = self.bot.screenshot_image()
+        h, w = image.shape[:2]
+        if w >= h:
+            return False
+        match = self.wait_for_template(
+            "小米客户端-补充资源下载-确定",
+            "xiaomi_missing_resources_confirm_button",
+            timeout_seconds=timeout_seconds,
+            threshold=0.90,
+            region=(int(w * 0.16), int(h * 0.54), int(w * 0.34), int(h * 0.16)),
+        )
+        self._record(
+            {
+                "type": "vision_feature",
+                "feature": "xiaomi_missing_resources_prompt",
+                "present": match is not None,
+                "x": match.x if match else None,
+                "y": match.y if match else None,
+                "width": match.width if match else None,
+                "height": match.height if match else None,
+                "score": round(match.score, 4) if match else 0.0,
+            }
+        )
+        if not match:
+            return False
+        self._save_image_snapshot("before_confirm_xiaomi_missing_resources", image)
+        self.tap("小米客户端-补充资源下载-确定", Point(*match.center), wait_seconds=8.0)
+        self._watchdog_reset()
+        self.screenshot("after_confirm_xiaomi_missing_resources")
+        return True
+
+    def save_xiaomi_graphics_settings_if_present(self, *, timeout_seconds: float = 0.8) -> bool:
+        if self.client_name != "小米":
+            return False
+        image = self.bot.screenshot_image()
+        h, w = image.shape[:2]
+        if w >= h:
+            return False
+        match = self.wait_for_template(
+            "小米客户端-画面设置-保存",
+            "xiaomi_graphics_settings_save_button",
+            timeout_seconds=timeout_seconds,
+            threshold=0.78,
+            region=(int(w * 0.42), int(h * 0.66), int(w * 0.34), int(h * 0.14)),
+        )
+        self._record(
+            {
+                "type": "vision_feature",
+                "feature": "xiaomi_graphics_settings",
+                "present": match is not None,
+                "x": match.x if match else None,
+                "y": match.y if match else None,
+                "width": match.width if match else None,
+                "height": match.height if match else None,
+                "score": round(match.score, 4) if match else 0.0,
+            }
+        )
+        if not match:
+            return False
+        self._save_image_snapshot("before_save_xiaomi_graphics_settings", image)
+        self.tap("小米客户端-画面设置-保存", Point(*match.center), wait_seconds=3.0)
+        self._watchdog_reset()
+        self.screenshot("after_save_xiaomi_graphics_settings")
+        return True
+
+    def confirm_xiaomi_background_resources_if_present(self) -> bool:
+        if self.client_name != "小米":
+            return False
+        image = self.bot.screenshot_image()
+        h, w = image.shape[:2]
+        if w >= h:
+            return False
+        match = self._find_template_in_image(
+            image,
+            "xiaomi_background_resources_confirm_button",
+            threshold=0.90,
+            region=(int(w * 0.16), int(h * 0.52), int(w * 0.34), int(h * 0.16)),
+        )
+        self._record(
+            {
+                "type": "vision_feature",
+                "feature": "xiaomi_background_resources_prompt",
+                "present": match is not None,
+                "x": match.x if match else None,
+                "y": match.y if match else None,
+                "width": match.width if match else None,
+                "height": match.height if match else None,
+                "score": round(match.score, 4) if match else 0.0,
+            }
+        )
+        if not match:
+            return False
+        self._save_image_snapshot("before_confirm_xiaomi_background_resources", image)
+        self.tap("小米客户端-静默下载资源-确认", Point(*match.center), wait_seconds=3.0)
+        self._watchdog_reset()
+        self.screenshot("after_confirm_xiaomi_background_resources")
+        return True
+
     def handle_entry_preconditions(
         self,
         *,
@@ -3235,6 +3382,18 @@ class SGZZStartAccountRunner:
                 }
             )
             if self.click_general_reward_card_if_present():
+                handled_any = True
+                continue
+            if self.confirm_xiaomi_missing_resources_if_present():
+                handled_any = True
+                continue
+            if self.confirm_xiaomi_background_resources_if_present():
+                handled_any = True
+                continue
+            if self.close_xiaomi_quick_login_prompt_if_present():
+                handled_any = True
+                continue
+            if self.save_xiaomi_graphics_settings_if_present():
                 handled_any = True
                 continue
             if self.close_notice_ack_if_present():
@@ -3440,6 +3599,25 @@ class SGZZStartAccountRunner:
                 )
                 break
 
+            enter_world_again = self.wait_for_template(
+                "进入游戏前置-再争乱世按钮排除",
+                "enter_world_again_button",
+                timeout_seconds=0.15,
+                threshold=0.74,
+                region=(int(w * 0.30), int(h * 0.76), int(w * 0.42), int(h * 0.18)),
+            )
+            if enter_world_again:
+                self._record(
+                    {
+                        "type": "state",
+                        "state": "landscape_dialogs_done",
+                        "reason": "enter_world_again_button_visible",
+                        "after_taps": index,
+                        "score": round(enter_world_again.score, 4),
+                    }
+                )
+                break
+
             continue_icon = self.wait_for_template(
                 "进入游戏前置-横屏剧情继续箭头",
                 "landscape_dialog_continue_icon",
@@ -3494,6 +3672,7 @@ class SGZZStartAccountRunner:
             }
         )
         tapped = False
+        unchanged_taps = 0
         for index in range(max(0, max_taps)):
             image = self.bot.screenshot_image()
             h, w = image.shape[:2]
@@ -3506,6 +3685,10 @@ class SGZZStartAccountRunner:
                         "after_taps": index,
                     }
                 )
+                break
+
+            if self.confirm_xiaomi_background_resources_if_present():
+                tapped = True
                 break
 
             title_marker_key, title_marker = self._detect_account_role_select_entry_marker(
@@ -3687,6 +3870,27 @@ class SGZZStartAccountRunner:
             )
             self.tap(f"进入游戏前置-跳过竖屏剧情({index + 1})", point, wait_seconds=0.9)
             tapped = True
+            after_tap = self.bot.screenshot_image()
+            change_score = self._roi_change_score(image, after_tap, 0, int(h * 0.42), w, h)
+            unchanged_taps = unchanged_taps + 1 if change_score <= 0.15 else 0
+            self._record(
+                {
+                    "type": "vision_feature",
+                    "feature": "portrait_dialog_after_tap_change",
+                    "change_score": round(change_score, 4),
+                    "unchanged_taps": unchanged_taps,
+                }
+            )
+            if unchanged_taps >= 2:
+                self._record(
+                    {
+                        "type": "state",
+                        "state": "portrait_dialogs_done",
+                        "reason": "repeated_tap_did_not_change_screen",
+                        "after_taps": index + 1,
+                    }
+                )
+                break
 
         if tapped:
             self.screenshot("after_skip_portrait_dialogs")
@@ -7500,6 +7704,40 @@ class SGZZStartAccountRunner:
         include_gacha: bool = True,
         include_gamecircle_signin: bool = False,
     ) -> Path:
+        if credential.client == "小米":
+            self._record(
+                {
+                    "type": "state",
+                    "state": "xiaomi_cached_login_wait_start",
+                    "account": credential.masked_account,
+                    "account_key": credential.account_key,
+                    "client": credential.client,
+                    "package": credential.package,
+                }
+            )
+            role_marker_key, role_marker = self.wait_for_account_role_select_entry(timeout_seconds=90.0)
+            self._record(
+                {
+                    "type": "vision_feature",
+                    "feature": "xiaomi_cached_login_role_select_entry",
+                    "present": role_marker is not None,
+                    "template": role_marker_key,
+                    "x": role_marker.x if role_marker else None,
+                    "y": role_marker.y if role_marker else None,
+                    "width": role_marker.width if role_marker else None,
+                    "height": role_marker.height if role_marker else None,
+                    "score": round(role_marker.score, 4) if role_marker else 0.0,
+                    "account": credential.masked_account,
+                }
+            )
+            if not role_marker:
+                path = self.screenshot("xiaomi_cached_login_role_select_not_found")
+                raise RuntimeError(
+                    f"Xiaomi cached login did not reach the role-select entry: {credential.masked_account}. "
+                    f"Check the emulator login page in {path}."
+                )
+            return self.screenshot("after_xiaomi_cached_login")
+
         if credential.client != DEFAULT_SGZZ_CLIENT:
             path = self.screenshot(f"{credential.client}_client_login_flow_pending")
             self._record(
@@ -7523,6 +7761,117 @@ class SGZZStartAccountRunner:
             include_gacha=include_gacha,
             include_gamecircle_signin=include_gamecircle_signin,
         )
+
+    @staticmethod
+    def _android_node_center(node: dict[str, str]) -> Point | None:
+        bounds = str(node.get("bounds") or "")
+        match = re.fullmatch(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", bounds)
+        if not match:
+            return None
+        left, top, right, bottom = (int(value) for value in match.groups())
+        if right <= left or bottom <= top:
+            return None
+        return Point((left + right) // 2, (top + bottom) // 2)
+
+    def _dump_xiaomi_login_nodes(self) -> list[dict[str, str]]:
+        remote_path = "/sdcard/sgzz_xiaomi_login.xml"
+        try:
+            self.bot.client.shell(["uiautomator", "dump", remote_path], timeout=8.0)
+            raw = self.bot.client.shell(["cat", remote_path], timeout=8.0)
+            xml_start = raw.find("<?xml")
+            if xml_start < 0:
+                return []
+            root = ET.fromstring(raw[xml_start:])
+            return [dict(node.attrib) for node in root.iter("node")]
+        except Exception as exc:
+            self._record(
+                {
+                    "type": "state",
+                    "state": "xiaomi_login_ui_dump_failed",
+                    "error": str(exc),
+                }
+            )
+            return []
+
+    def _record_xiaomi_login_ui_state(self, state: str) -> None:
+        if state == self._xiaomi_login_ui_state:
+            return
+        self._xiaomi_login_ui_state = state
+        self._record(
+            {
+                "type": "state",
+                "state": state,
+                "client": "小米",
+                "package": self.package,
+            }
+        )
+
+    def handle_xiaomi_login_interstitial(self) -> str | None:
+        try:
+            focus = self.bot.client.current_focus()
+        except Exception:
+            return None
+        if "com.xiaomi.gamecenter" not in focus:
+            return None
+
+        nodes = self._dump_xiaomi_login_nodes()
+        if not nodes:
+            self._record_xiaomi_login_ui_state("xiaomi_login_sdk_loading")
+            self._watchdog_reset()
+            return "sdk_loading"
+
+        for node in nodes:
+            text = str(node.get("text") or "").strip()
+            if "同意并继续" not in text:
+                continue
+            point = self._android_node_center(node)
+            if point is None:
+                continue
+            self._record_xiaomi_login_ui_state("xiaomi_login_privacy_confirmation")
+            self.tap("小米登录-同意并继续", point, wait_seconds=2.0)
+            self._watchdog_reset()
+            return "privacy_confirmed"
+
+        texts = [str(node.get("text") or "").strip() for node in nodes]
+        verification_page = any("验证码" in text for text in texts)
+        if verification_page:
+            entered_length = 0
+            for node in nodes:
+                if node.get("class") != "android.widget.EditText":
+                    continue
+                value = str(node.get("text") or "").strip()
+                if value.isdigit():
+                    entered_length = max(entered_length, len(value))
+            if entered_length == 6:
+                for node in nodes:
+                    if str(node.get("text") or "").strip() != "确定":
+                        continue
+                    point = self._android_node_center(node)
+                    if point is None:
+                        continue
+                    self._record_xiaomi_login_ui_state("xiaomi_sms_code_ready")
+                    self._record(
+                        {
+                            "type": "state",
+                            "state": "xiaomi_sms_code_length_confirmed",
+                            "length": entered_length,
+                        }
+                    )
+                    self.tap("小米登录-验证码已满6位-确定", point, wait_seconds=3.0)
+                    self._watchdog_reset()
+                    return "sms_confirmed"
+            self._record_xiaomi_login_ui_state("xiaomi_sms_code_waiting")
+            self._watchdog_reset()
+            return "sms_waiting"
+
+        if any("登录中" in text for text in texts):
+            self._record_xiaomi_login_ui_state("xiaomi_cached_login_in_progress")
+            self._watchdog_reset()
+            return "cached_login_in_progress"
+
+        self._record_xiaomi_login_ui_state("xiaomi_login_sdk_visible")
+        self._watchdog_reset()
+        return "sdk_visible"
 
     def _detect_account_role_select_entry_marker(
         self,
@@ -7594,6 +7943,17 @@ class SGZZStartAccountRunner:
                 self.close_exit_confirm_if_present(timeout_seconds=0.2)
                 self._sleep_with_watchdog(0.4, source="wait_for_account_role_select_entry_exit_confirm")
                 continue
+            if self.client_name == "小米":
+                role_marker_key, role_marker = self._detect_account_role_select_entry_marker(
+                    image,
+                    source="xiaomi_login_wait",
+                )
+                if role_marker:
+                    break
+                xiaomi_state = self.handle_xiaomi_login_interstitial()
+                if xiaomi_state is not None:
+                    sleep(0.6)
+                    continue
             if self.click_recent_login_account_if_present(timeout_seconds=0.2):
                 self.click_account_login_modal_if_present(timeout_seconds=1.5)
                 self.click_login_secondary_confirm_if_present(timeout_seconds=1.0)
@@ -7881,7 +8241,7 @@ class SGZZStartAccountRunner:
 
         role_marker_key = None
         role_marker = None
-        end_at = time() + 24.0
+        end_at = time() + (60.0 if self.client_name == "小米" else 24.0)
         while time() < end_at:
             if self.confirm_account_logout_if_present(timeout_seconds=0.35):
                 continue
@@ -8313,7 +8673,7 @@ class SGZZStartAccountRunner:
 
         row_repeat_threshold = 0.88
         title_repeat_threshold = 0.96
-        ingame_repeat_threshold = 0.90
+        ingame_repeat_threshold = 0.94
         like_limit_stop_threshold = max(
             1,
             int(os.environ.get("SGZZ_LIKE_LIMIT_CONSECUTIVE_STOP_COUNT", "3")),
@@ -8337,6 +8697,7 @@ class SGZZStartAccountRunner:
         first_title_template: np.ndarray | None = None
         first_ingame_template: np.ndarray | None = None
         unavailable_role_fingerprints: set[str] = set()
+        unavailable_role_templates: list[np.ndarray] = []
         processed_offset = int(os.environ.get("SGZZ_ROLE_IDENTITY_PROCESSED_OFFSET", "0"))
         processed_cycles = processed_offset
         daily_like_done_count = 0
@@ -8368,6 +8729,14 @@ class SGZZStartAccountRunner:
                         "loaded": seed_image is not None,
                     }
                 )
+        self._record(
+            {
+                "type": "state",
+                "state": "account_remaining_role_resume_context",
+                "processed_offset": processed_offset,
+                "seed_run_dir": seed_run_dir_text or None,
+            }
+        )
         cycle = 1
         like_limit_consecutive_count = 0
         while cycle <= max_cycles:
@@ -8430,8 +8799,9 @@ class SGZZStartAccountRunner:
                     selector_image,
                     row_identity_region,
                 )
+                row_identity_crop = self._crop(selector_image, row_identity_region).copy()
                 if first_row_template is None:
-                    first_row_template = self._crop(selector_image, row_identity_region).copy()
+                    first_row_template = row_identity_crop.copy()
                     self._record(
                         {
                             "type": "state",
@@ -8441,7 +8811,18 @@ class SGZZStartAccountRunner:
                     )
 
                 last_fingerprint = self.fingerprint_server_selector_role_row(last_row)
-                if last_fingerprint and last_fingerprint in unavailable_role_fingerprints:
+                unavailable_repeat_score = max(
+                    (
+                        self._template_similarity(row_identity_crop, unavailable_template)
+                        for unavailable_template in unavailable_role_templates
+                    ),
+                    default=0.0,
+                )
+                unavailable_repeat = (
+                    (last_fingerprint and last_fingerprint in unavailable_role_fingerprints)
+                    or unavailable_repeat_score >= 0.97
+                )
+                if unavailable_repeat:
                     self._record(
                         {
                             "type": "state",
@@ -8449,6 +8830,7 @@ class SGZZStartAccountRunner:
                             "iteration": cycle,
                             "processed_cycles": processed_cycles,
                             "fingerprint": last_fingerprint,
+                            "row_similarity": round(unavailable_repeat_score, 4),
                         }
                     )
                     self._watchdog_reset()
@@ -8541,6 +8923,9 @@ class SGZZStartAccountRunner:
                             click_login_after_prompt=True,
                         )
 
+                    quick_login_closed = self.close_xiaomi_quick_login_prompt_if_present(
+                        timeout_seconds=1.0
+                    )
                     notice_closed = self.close_notice_ack_if_present()
                     entry_image = self.bot.screenshot_image()
                     entry_marker_key, entry_marker = self._detect_account_role_select_entry_marker(
@@ -8557,6 +8942,7 @@ class SGZZStartAccountRunner:
                             "state": "account_remaining_role_entry_check",
                             "iteration": cycle,
                             "attempt": entry_attempt,
+                            "quick_login_closed": quick_login_closed,
                             "notice_closed": notice_closed,
                             "still_on_title": still_on_title,
                             "marker": entry_marker_key,
@@ -8571,6 +8957,7 @@ class SGZZStartAccountRunner:
                 if role_entry_unavailable:
                     if last_fingerprint:
                         unavailable_role_fingerprints.add(last_fingerprint)
+                    unavailable_role_templates.append(row_identity_crop.copy())
                     self._record(
                         {
                             "type": "state",
@@ -8699,7 +9086,7 @@ class SGZZStartAccountRunner:
             )
 
         processed_this_run = max(0, processed_cycles - processed_offset)
-        account_like_completed = processed_this_run > 0 and (
+        account_like_completed = processed_cycles > 0 and (
             daily_like_done_count >= processed_this_run or like_limit_stop_reached
         )
         self._last_account_cycle_summary = {
@@ -8851,6 +9238,11 @@ class SGZZStartAccountRunner:
                 for attempt in range(1, self._watchdog_restart_limit + 2):
                     os.environ.pop("SGZZ_ROLE_IDENTITY_PROCESSED_OFFSET", None)
                     os.environ.pop("SGZZ_ROLE_IDENTITY_SEED_RUN_DIR", None)
+                    if index == 1 and attempt == 1:
+                        if previous_offset is not None:
+                            os.environ["SGZZ_ROLE_IDENTITY_PROCESSED_OFFSET"] = previous_offset
+                        if previous_seed is not None:
+                            os.environ["SGZZ_ROLE_IDENTITY_SEED_RUN_DIR"] = previous_seed
                     self._record(
                         {
                             "type": "state",

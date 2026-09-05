@@ -8785,8 +8785,77 @@ class SGZZStartAccountRunner:
                             "Account remaining-role cycle restored a hidden role, but still could not detect role rows."
                         )
 
-                last_row = rows[-1]
                 selector_image = self.bot.screenshot_image()
+                selected_row: tuple[
+                    dict[str, int | float],
+                    tuple[int, int, int, int],
+                    np.ndarray,
+                    str,
+                ] | None = None
+                skipped_unavailable_rows = 0
+                for candidate_row in reversed(rows):
+                    candidate_region = self.server_selector_role_identity_region(
+                        candidate_row,
+                        selector_image,
+                    )
+                    candidate_crop = self._crop(selector_image, candidate_region).copy()
+                    candidate_fingerprint = self.fingerprint_server_selector_role_row(
+                        candidate_row,
+                        selector_image,
+                    )
+                    unavailable_similarity = max(
+                        (
+                            self._template_similarity(candidate_crop, unavailable_template)
+                            for unavailable_template in unavailable_role_templates
+                        ),
+                        default=0.0,
+                    )
+                    known_unavailable = bool(
+                        (
+                            candidate_fingerprint
+                            and candidate_fingerprint in unavailable_role_fingerprints
+                        )
+                        or unavailable_similarity >= 0.97
+                    )
+                    if known_unavailable:
+                        skipped_unavailable_rows += 1
+                        self._record(
+                            {
+                                "type": "vision_feature",
+                                "feature": "account_remaining_unavailable_role_row_skipped",
+                                "iteration": cycle,
+                                "row_y": int(candidate_row["y"]),
+                                "tap_y": int(candidate_row["tap_y"]),
+                                "fingerprint": candidate_fingerprint,
+                                "row_similarity": round(unavailable_similarity, 4),
+                            }
+                        )
+                        continue
+                    selected_row = (
+                        candidate_row,
+                        candidate_region,
+                        candidate_crop,
+                        candidate_fingerprint,
+                    )
+                    break
+
+                if selected_row is None:
+                    self._record(
+                        {
+                            "type": "state",
+                            "state": "account_remaining_roles_only_unavailable_stop",
+                            "iteration": cycle,
+                            "processed_cycles": processed_cycles,
+                            "role_row_count": len(rows),
+                            "skipped_unavailable_rows": skipped_unavailable_rows,
+                        }
+                    )
+                    self._watchdog_reset()
+                    self.screenshot("account_remaining_roles_only_unavailable_stop")
+                    completion_reason = "only_unavailable_roles"
+                    break
+
+                last_row, row_identity_region, row_identity_crop, last_fingerprint = selected_row
                 row_identity_region = self.server_selector_role_identity_region(last_row, selector_image)
                 row_identity_score = self.compare_role_identity_crop(
                     label="server_selector_last_role_row",
@@ -8799,7 +8868,6 @@ class SGZZStartAccountRunner:
                     selector_image,
                     row_identity_region,
                 )
-                row_identity_crop = self._crop(selector_image, row_identity_region).copy()
                 if first_row_template is None:
                     first_row_template = row_identity_crop.copy()
                     self._record(
@@ -8809,34 +8877,6 @@ class SGZZStartAccountRunner:
                             "path": str(row_identity_path),
                         }
                     )
-
-                last_fingerprint = self.fingerprint_server_selector_role_row(last_row)
-                unavailable_repeat_score = max(
-                    (
-                        self._template_similarity(row_identity_crop, unavailable_template)
-                        for unavailable_template in unavailable_role_templates
-                    ),
-                    default=0.0,
-                )
-                unavailable_repeat = (
-                    (last_fingerprint and last_fingerprint in unavailable_role_fingerprints)
-                    or unavailable_repeat_score >= 0.97
-                )
-                if unavailable_repeat:
-                    self._record(
-                        {
-                            "type": "state",
-                            "state": "account_remaining_roles_unavailable_role_repeated_stop",
-                            "iteration": cycle,
-                            "processed_cycles": processed_cycles,
-                            "fingerprint": last_fingerprint,
-                            "row_similarity": round(unavailable_repeat_score, 4),
-                        }
-                    )
-                    self._watchdog_reset()
-                    self.screenshot("account_remaining_roles_unavailable_role_repeated_stop")
-                    completion_reason = "unavailable_role_repeated"
-                    break
                 row_repeat_candidate = processed_cycles > 0 and row_identity_score >= row_repeat_threshold
                 self._record(
                     {
@@ -8852,6 +8892,7 @@ class SGZZStartAccountRunner:
                         "row_identity_path": str(row_identity_path),
                         "row_identity_score": round(row_identity_score, 4),
                         "row_repeat_candidate": row_repeat_candidate,
+                        "skipped_unavailable_rows": skipped_unavailable_rows,
                     }
                 )
 
@@ -8958,6 +8999,17 @@ class SGZZStartAccountRunner:
                     if last_fingerprint:
                         unavailable_role_fingerprints.add(last_fingerprint)
                     unavailable_role_templates.append(row_identity_crop.copy())
+                    if processed_cycles == 0:
+                        first_row_template = None
+                        first_title_template = None
+                        first_ingame_template = None
+                        self._record(
+                            {
+                                "type": "state",
+                                "state": "account_remaining_unavailable_baseline_reset",
+                                "iteration": cycle,
+                            }
+                        )
                     self._record(
                         {
                             "type": "state",

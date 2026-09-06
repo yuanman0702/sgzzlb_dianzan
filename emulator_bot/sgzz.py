@@ -1947,6 +1947,83 @@ class SGZZStartAccountRunner:
             rows.append(row)
 
         rows.sort(key=lambda item: int(item["center_y"]))
+
+        # The currently selected role avatar is rendered with much lower saturation,
+        # so the color mask above can omit exactly the row we need to keep selected.
+        # Recover missing row slots from the regular row cadence, but only when the
+        # avatar-sized ROI still contains enough grayscale detail to be occupied.
+        inferred_rows: list[dict[str, int | float | bool]] = []
+        if len(rows) >= 4:
+            centers = [int(item["center_y"]) for item in rows]
+            regular_gaps = [
+                right - left
+                for left, right in zip(centers, centers[1:])
+                if 58 <= right - left <= 88
+            ]
+            if regular_gaps:
+                row_step = int(round(float(np.median(regular_gaps))))
+                candidate_centers: list[int] = []
+                for left, right in zip(centers, centers[1:]):
+                    if row_step * 1.6 <= right - left <= row_step * 2.4:
+                        candidate_centers.append(left + row_step)
+
+                trailing_center = centers[-1] + row_step
+                if (
+                    len(rows) >= 6
+                    and centers[0] <= int(h * 0.23)
+                    and trailing_center <= int(h * 0.56)
+                ):
+                    candidate_centers.append(trailing_center)
+
+                avatar_center_x = int(round(float(np.median([int(item["center_x"]) for item in rows]))))
+                for candidate_center in sorted(set(candidate_centers)):
+                    avatar_x1 = max(0, avatar_center_x - 28)
+                    avatar_x2 = min(w, avatar_center_x + 28)
+                    avatar_y1 = max(0, candidate_center - 28)
+                    avatar_y2 = min(h, candidate_center + 28)
+                    avatar_crop = image[avatar_y1:avatar_y2, avatar_x1:avatar_x2]
+                    if avatar_crop.size == 0:
+                        continue
+                    avatar_gray = cv2.cvtColor(avatar_crop, cv2.COLOR_BGR2GRAY)
+                    avatar_edges = cv2.Canny(avatar_gray, 45, 120)
+                    gray_std = float(avatar_gray.std())
+                    edge_ratio = float((avatar_edges > 0).mean())
+                    occupied = gray_std >= 14.0 and edge_ratio >= 0.045
+                    self._record(
+                        {
+                            "type": "vision_feature",
+                            "feature": "server_selector_inferred_role_row_candidate",
+                            "center_y": candidate_center,
+                            "gray_std": round(gray_std, 4),
+                            "edge_ratio": round(edge_ratio, 6),
+                            "occupied": occupied,
+                        }
+                    )
+                    if not occupied:
+                        continue
+                    inferred_rows.append(
+                        {
+                            "x": avatar_center_x - 24,
+                            "y": candidate_center - 24,
+                            "width": 48,
+                            "height": 48,
+                            "center_x": avatar_center_x,
+                            "center_y": candidate_center,
+                            "tap_x": int(center_x),
+                            "tap_y": candidate_center,
+                            "area": 0.0,
+                            "inferred_selected": True,
+                        }
+                    )
+
+        if inferred_rows:
+            existing_centers = [int(item["center_y"]) for item in rows]
+            for inferred_row in inferred_rows:
+                inferred_center = int(inferred_row["center_y"])
+                if all(abs(inferred_center - center) > 24 for center in existing_centers):
+                    rows.append(inferred_row)
+                    existing_centers.append(inferred_center)
+            rows.sort(key=lambda item: int(item["center_y"]))
         self._record(
             {
                 "type": "vision_feature",
@@ -2190,6 +2267,63 @@ class SGZZStartAccountRunner:
             if not changed:
                 break
         return self.screenshot("server_selector_bottom_scrolled")
+
+    def scroll_server_selector_to_top(self, *, swipe_count: int = 3) -> Path:
+        self._record(
+            {
+                "type": "state",
+                "state": "scroll_server_selector_to_top",
+                "swipe_count": swipe_count,
+            }
+        )
+        pull_count = min(max(1, swipe_count), 3)
+        for index in range(pull_count):
+            before = self.bot.screenshot_image()
+            h, w = before.shape[:2]
+            swipe_x = int(w * 0.125)
+            start_y = int(h * 0.25)
+            end_y = int(h * 0.58)
+            list_top = int(h * 0.18)
+            list_bottom = int(h * 0.62)
+            roi_x1 = int(w * 0.03)
+            roi_x2 = int(w * 0.94)
+            self._record(
+                {
+                    "type": "vision_feature",
+                    "feature": "server_selector_scroll_points",
+                    "direction": "top",
+                    "index": index,
+                    "list_top": list_top,
+                    "list_bottom": list_bottom,
+                    "start_y": start_y,
+                    "end_y": end_y,
+                    "swipe_x": swipe_x,
+                    "change_roi_x1": roi_x1,
+                    "change_roi_x2": roi_x2,
+                    "max_pulls": pull_count,
+                }
+            )
+
+            self.bot.swipe(swipe_x, start_y, swipe_x, end_y, 380)
+            self._sleep_with_watchdog(0.45, source="server_selector_scroll_top")
+            after = self.bot.screenshot_image()
+            change_score = self._roi_change_score(before, after, roi_x1, list_top, roi_x2, list_bottom)
+            changed = change_score > 1.0
+            self.screenshot(f"server_selector_top_swipe_{index:02d}_{'changed' if changed else 'static'}")
+            self._record(
+                {
+                    "type": "state",
+                    "state": "server_selector_swipe",
+                    "direction": "top",
+                    "index": index,
+                    "changed": changed,
+                    "used_x": swipe_x,
+                    "change_score": round(change_score, 4),
+                }
+            )
+            if not changed:
+                break
+        return self.screenshot("server_selector_top_scrolled")
 
     def click_enter_world_again_if_present(self, *, timeout_seconds: float = 1.2) -> bool:
         self._record({"type": "state", "state": "click_enter_world_again_if_present"})
@@ -5752,7 +5886,7 @@ class SGZZStartAccountRunner:
 
         image = self.bot.screenshot_image()
         h, w = image.shape[:2]
-        for attempt in range(1, 5):
+        for attempt in range(1, 7):
             image = self.bot.screenshot_image()
             h, w = image.shape[:2]
             if self.detect_like_main_screen():
@@ -5764,6 +5898,42 @@ class SGZZStartAccountRunner:
                     }
                 )
                 return self.screenshot("after_gacha_back_from_recruit_page_already_main")
+
+            if w < h:
+                overlay = image[int(h * 0.50) : int(h * 0.70), int(w * 0.25) : int(w * 0.98)]
+                overlay_gray = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
+                overlay_mean = float(overlay_gray.mean())
+                overlay_dark_ratio = float((overlay_gray < 70).mean())
+                continue_icon = self._find_template_in_image(
+                    image,
+                    "dialog_continue_icon",
+                    threshold=0.45,
+                    region=(int(w * 0.76), int(h * 0.50), int(w * 0.24), int(h * 0.32)),
+                )
+                if overlay_mean <= 92 and overlay_dark_ratio >= 0.45 and continue_icon:
+                    point = Point(*continue_icon.center)
+                    self._record(
+                        {
+                            "type": "vision_feature",
+                            "feature": "gacha_return_dialog_continue",
+                            "attempt": attempt,
+                            "overlay_mean": round(overlay_mean, 1),
+                            "overlay_dark_ratio": round(overlay_dark_ratio, 3),
+                            "x": continue_icon.x,
+                            "y": continue_icon.y,
+                            "width": continue_icon.width,
+                            "height": continue_icon.height,
+                            "score": round(continue_icon.score, 4),
+                            "tap_x": point.x,
+                            "tap_y": point.y,
+                        }
+                    )
+                    self.tap(
+                        f"抽卡流程-返回时推进武将展示#{attempt}",
+                        point,
+                        wait_seconds=self._fast_wait(1.8, 1.0),
+                    )
+                    continue
 
             button = self._find_template_in_image(
                 image,
@@ -5829,6 +5999,20 @@ class SGZZStartAccountRunner:
                 return self.screenshot("after_gacha_back_from_recruit_page")
             self.close_exit_confirm_if_present(timeout_seconds=0.35)
 
+        recovered = self.recover_to_main_screen(max_steps=10)
+        self._record(
+            {
+                "type": "state",
+                "state": "gacha_back_from_recruit_page_recovery",
+                "recovered": recovered,
+            }
+        )
+        if recovered:
+            return self.screenshot("after_gacha_back_from_recruit_page_recovery")
+
+        self._finish_black_screen_watchdog_if_active(
+            source="gacha_back_from_recruit_page_failure"
+        )
         self.screenshot("gacha_recruit_page_back_button_not_found")
         raise RuntimeError("Gacha flow could not return from the recruit page to the main screen.")
 
@@ -8743,12 +8927,30 @@ class SGZZStartAccountRunner:
         if max_cycles < 1:
             raise ValueError("Account remaining-role cycle count must be at least 1.")
 
+        role_selection_order = os.environ.get("SGZZ_ROLE_SELECTION_ORDER", "bottom").strip().lower()
+        if role_selection_order not in {"top", "bottom"}:
+            role_selection_order = "bottom"
         row_repeat_threshold = 0.88
         title_repeat_threshold = 0.96
         ingame_repeat_threshold = 0.94
         like_limit_stop_threshold = max(
             1,
             int(os.environ.get("SGZZ_LIKE_LIMIT_CONSECUTIVE_STOP_COUNT", "3")),
+        )
+        incomplete_role_retry_limit = max(
+            0,
+            min(120, int(os.environ.get("SGZZ_INCOMPLETE_ROLE_RETRY_LIMIT", "20"))),
+        )
+        incomplete_role_retry_wait_seconds = max(
+            0.0,
+            min(25.0, float(os.environ.get("SGZZ_INCOMPLETE_ROLE_RETRY_WAIT_SECONDS", "15"))),
+        )
+        entry_failure_title_match_threshold = max(
+            0.70,
+            min(
+                0.98,
+                float(os.environ.get("SGZZ_ROLE_ENTRY_FAILURE_TITLE_MATCH_THRESHOLD", "0.86")),
+            ),
         )
         self._record(
             {
@@ -8757,10 +8959,14 @@ class SGZZStartAccountRunner:
                 "max_cycles": max_cycles,
                 "include_gacha": include_gacha,
                 "include_gamecircle_signin": include_gamecircle_signin,
+                "role_selection_order": role_selection_order,
                 "row_repeat_threshold": row_repeat_threshold,
                 "title_repeat_threshold": title_repeat_threshold,
                 "ingame_repeat_threshold": ingame_repeat_threshold,
                 "like_limit_stop_threshold": like_limit_stop_threshold,
+                "incomplete_role_retry_limit": incomplete_role_retry_limit,
+                "incomplete_role_retry_wait_seconds": incomplete_role_retry_wait_seconds,
+                "entry_failure_title_match_threshold": entry_failure_title_match_threshold,
             }
         )
         self.screenshot("before_account_remaining_roles_daily_cycle")
@@ -8770,6 +8976,8 @@ class SGZZStartAccountRunner:
         first_ingame_template: np.ndarray | None = None
         unavailable_role_fingerprints: set[str] = set()
         unavailable_role_templates: list[np.ndarray] = []
+        entry_failure_roles: list[dict[str, object]] = []
+        unavailable_role_count = 0
         processed_role_templates: list[np.ndarray] = []
         processed_offset = int(os.environ.get("SGZZ_ROLE_IDENTITY_PROCESSED_OFFSET", "0"))
         processed_cycles = processed_offset
@@ -8812,6 +9020,7 @@ class SGZZStartAccountRunner:
         )
         cycle = 1
         like_limit_consecutive_count = 0
+        incomplete_role_retry_count = 0
         while cycle <= max_cycles:
             self._record(
                 {
@@ -8824,7 +9033,10 @@ class SGZZStartAccountRunner:
             try:
                 self.switch_account_to_role_select()
                 self.open_server_selector()
-                self.scroll_server_selector_to_bottom()
+                if role_selection_order == "bottom":
+                    self.scroll_server_selector_to_bottom()
+                else:
+                    self.scroll_server_selector_to_top()
                 rows = self.detect_server_selector_role_rows()
                 if not rows:
                     self.screenshot("account_remaining_roles_no_role_rows")
@@ -8859,6 +9071,7 @@ class SGZZStartAccountRunner:
                         )
 
                 selector_image = self.bot.screenshot_image()
+                candidate_rows = list(reversed(rows)) if role_selection_order == "bottom" else rows
                 selected_row: tuple[
                     dict[str, int | float],
                     tuple[int, int, int, int],
@@ -8867,7 +9080,7 @@ class SGZZStartAccountRunner:
                 ] | None = None
                 skipped_unavailable_rows = 0
                 skipped_processed_rows = 0
-                for candidate_row in reversed(rows):
+                for candidate_row in candidate_rows:
                     candidate_region = self.server_selector_role_identity_region(
                         candidate_row,
                         selector_image,
@@ -8950,10 +9163,10 @@ class SGZZStartAccountRunner:
                     completion_reason = "all_roles_classified"
                     break
 
-                last_row, row_identity_region, row_identity_crop, last_fingerprint = selected_row
-                row_identity_region = self.server_selector_role_identity_region(last_row, selector_image)
+                role_row, row_identity_region, row_identity_crop, role_fingerprint = selected_row
+                row_identity_region = self.server_selector_role_identity_region(role_row, selector_image)
                 row_identity_score = self.compare_role_identity_crop(
-                    label="server_selector_last_role_row",
+                    label="server_selector_selected_role_row",
                     image=selector_image,
                     region=row_identity_region,
                     template=first_row_template,
@@ -8976,14 +9189,16 @@ class SGZZStartAccountRunner:
                 self._record(
                     {
                         "type": "vision_feature",
-                        "feature": "account_remaining_last_role",
+                        "feature": "account_remaining_selected_role",
                         "iteration": cycle,
+                        "role_selection_order": role_selection_order,
                         "role_row_count": len(rows),
-                        "row_x": int(last_row["x"]),
-                        "row_y": int(last_row["y"]),
-                        "tap_x": int(last_row["tap_x"]),
-                        "tap_y": int(last_row["tap_y"]),
-                        "fingerprint": last_fingerprint,
+                        "row_x": int(role_row["x"]),
+                        "row_y": int(role_row["y"]),
+                        "tap_x": int(role_row["tap_x"]),
+                        "tap_y": int(role_row["tap_y"]),
+                        "inferred_selected": bool(role_row.get("inferred_selected", False)),
+                        "fingerprint": role_fingerprint,
                         "row_identity_path": str(row_identity_path),
                         "row_identity_score": round(row_identity_score, 4),
                         "row_repeat_candidate": row_repeat_candidate,
@@ -8992,9 +9207,9 @@ class SGZZStartAccountRunner:
                     }
                 )
 
-                point = Point(int(last_row["tap_x"]), int(last_row["tap_y"]))
-                self.tap("本账号剩余角色-选择最后一个角色", point, wait_seconds=0.8)
-                self.tap_server_selector_confirm("本账号剩余角色-确定最后一个角色", wait_seconds=1.5)
+                point = Point(int(role_row["tap_x"]), int(role_row["tap_y"]))
+                self.tap("本账号剩余角色-选择当前角色", point, wait_seconds=0.8)
+                self.tap_server_selector_confirm("本账号剩余角色-确定当前角色", wait_seconds=1.5)
                 title_screenshot_path = self.screenshot("after_account_remaining_select_role")
                 title_image = cv2.imread(str(title_screenshot_path))
                 if title_image is None:
@@ -9011,8 +9226,9 @@ class SGZZStartAccountRunner:
                     title_image,
                     title_identity_region,
                 )
+                title_identity_crop = self._crop(title_image, title_identity_region).copy()
                 if first_title_template is None:
-                    first_title_template = self._crop(title_image, title_identity_region).copy()
+                    first_title_template = title_identity_crop.copy()
                     self._record(
                         {
                             "type": "state",
@@ -9020,6 +9236,22 @@ class SGZZStartAccountRunner:
                             "path": str(title_identity_path),
                         }
                     )
+
+                matching_entry_failure: dict[str, object] | None = None
+                entry_failure_title_score = 0.0
+                for entry_failure in entry_failure_roles:
+                    failed_title_template = entry_failure.get("title_template")
+                    if not isinstance(failed_title_template, np.ndarray):
+                        continue
+                    failure_score = self._template_similarity(
+                        title_identity_crop,
+                        failed_title_template,
+                    )
+                    if failure_score > entry_failure_title_score:
+                        entry_failure_title_score = failure_score
+                        matching_entry_failure = entry_failure
+                if entry_failure_title_score < entry_failure_title_match_threshold:
+                    matching_entry_failure = None
 
                 title_repeat_candidate = processed_cycles > 0 and title_identity_score >= title_repeat_threshold
                 title_repeat = title_repeat_candidate and row_repeat_candidate
@@ -9033,6 +9265,8 @@ class SGZZStartAccountRunner:
                         "row_repeat_candidate": row_repeat_candidate,
                         "title_repeat_candidate": title_repeat_candidate,
                         "repeat": title_repeat,
+                        "entry_failure_title_score": round(entry_failure_title_score, 4),
+                        "entry_failure_retry": matching_entry_failure is not None,
                     }
                 )
                 if title_repeat:
@@ -9050,8 +9284,12 @@ class SGZZStartAccountRunner:
                     completion_reason = "repeated_title_identity"
                     break
 
-                role_entry_unavailable = False
-                for entry_attempt in range(1, 3):
+                entry_attempt_limit = max(
+                    2,
+                    min(6, int(os.environ.get("SGZZ_ROLE_ENTRY_ATTEMPTS", "4"))),
+                )
+                role_entry_ready = False
+                for entry_attempt in range(1, entry_attempt_limit + 1):
                     if entry_attempt == 1:
                         self.enter_selected_server(wait_seconds=8.0)
                     else:
@@ -9087,38 +9325,87 @@ class SGZZStartAccountRunner:
                         }
                     )
                     if not still_on_title:
+                        role_entry_ready = True
                         break
-                    if entry_attempt >= 2:
-                        role_entry_unavailable = True
 
-                if role_entry_unavailable:
-                    if last_fingerprint:
-                        unavailable_role_fingerprints.add(last_fingerprint)
-                    unavailable_role_templates.append(row_identity_crop.copy())
-                    if processed_cycles == 0:
-                        first_row_template = None
-                        first_title_template = None
-                        first_ingame_template = None
-                        self._record(
-                            {
-                                "type": "state",
-                                "state": "account_remaining_unavailable_baseline_reset",
-                                "iteration": cycle,
-                            }
-                        )
+                if not role_entry_ready:
+                    if matching_entry_failure is None:
+                        matching_entry_failure = {
+                            "title_template": title_identity_crop.copy(),
+                            "title_identity_path": str(title_identity_path),
+                            "failure_batches": 0,
+                            "row_templates": [],
+                            "fingerprints": set(),
+                        }
+                        entry_failure_roles.append(matching_entry_failure)
+                    failure_batches = int(matching_entry_failure.get("failure_batches", 0)) + 1
+                    matching_entry_failure["failure_batches"] = failure_batches
+                    failed_row_templates = matching_entry_failure.get("row_templates")
+                    if not isinstance(failed_row_templates, list):
+                        failed_row_templates = []
+                        matching_entry_failure["row_templates"] = failed_row_templates
+                    failed_row_templates.append(row_identity_crop.copy())
+                    failed_fingerprints = matching_entry_failure.get("fingerprints")
+                    if not isinstance(failed_fingerprints, set):
+                        failed_fingerprints = set()
+                        matching_entry_failure["fingerprints"] = failed_fingerprints
+                    if role_fingerprint:
+                        failed_fingerprints.add(role_fingerprint)
+
+                    classify_unavailable = failure_batches >= 2
+                    if classify_unavailable:
+                        unavailable_role_fingerprints.update(failed_fingerprints)
+                        unavailable_role_templates.extend(failed_row_templates)
+                        unavailable_role_count += 1
+                        entry_failure_roles.remove(matching_entry_failure)
                     self._record(
                         {
                             "type": "state",
-                            "state": "account_remaining_role_server_unavailable_skip",
+                            "state": (
+                                "account_remaining_role_classified_unavailable"
+                                if classify_unavailable
+                                else "account_remaining_role_entry_retry_deferred"
+                            ),
                             "iteration": cycle,
                             "processed_cycles": processed_cycles,
-                            "fingerprint": last_fingerprint,
-                            "reason": "title_screen_remained_after_two_entry_attempts",
+                            "fingerprint": role_fingerprint,
+                            "entry_attempt_limit": entry_attempt_limit,
+                            "failure_batches": failure_batches,
+                            "total_entry_attempts": failure_batches * entry_attempt_limit,
+                            "entry_failure_title_score": round(entry_failure_title_score, 4),
+                            "reason": "title_screen_remained_after_entry_retries",
+                            "title_marker_confirmed_each_attempt": True,
+                            "row_identity_path": str(row_identity_path),
+                            "title_identity_path": str(title_identity_path),
+                            "action": (
+                                "skip_classified_unavailable_role_and_continue"
+                                if classify_unavailable
+                                else "retry_same_role_before_classifying_unavailable"
+                            ),
                         }
                     )
-                    self.screenshot("account_remaining_role_server_unavailable_skip")
-                    cycle += 1
+                    self._watchdog_reset()
+                    self.screenshot(
+                        "account_remaining_role_classified_unavailable"
+                        if classify_unavailable
+                        else "account_remaining_role_entry_retry_deferred"
+                    )
                     continue
+
+                if matching_entry_failure is not None:
+                    failure_batches = int(matching_entry_failure.get("failure_batches", 0))
+                    self._record(
+                        {
+                            "type": "state",
+                            "state": "account_remaining_role_entry_recovered_after_retry",
+                            "iteration": cycle,
+                            "processed_cycles": processed_cycles,
+                            "failure_batches": failure_batches,
+                            "entry_failure_title_score": round(entry_failure_title_score, 4),
+                            "title_identity_path": str(title_identity_path),
+                        }
+                    )
+                    entry_failure_roles.remove(matching_entry_failure)
 
                 self.handle_entry_preconditions(max_rounds=8)
                 self.close_signin_reward_if_present(timeout_seconds=2.0)
@@ -9176,6 +9463,7 @@ class SGZZStartAccountRunner:
                     include_gamecircle_signin=include_gamecircle_signin,
                 )
                 if not self._last_daily_like_done:
+                    incomplete_role_retry_count += 1
                     self._record(
                         {
                             "type": "state",
@@ -9186,13 +9474,35 @@ class SGZZStartAccountRunner:
                             "like_limit_reached": self._last_like_limit_reached,
                             "reason": "daily_like_not_completed",
                             "row_identity_path": str(row_identity_path),
+                            "retry_count": incomplete_role_retry_count,
+                            "retry_limit": incomplete_role_retry_limit,
                         }
                     )
                     self._watchdog_reset()
                     self.screenshot("account_remaining_role_flow_incomplete_not_marked")
+                    if incomplete_role_retry_count <= incomplete_role_retry_limit:
+                        self._record(
+                            {
+                                "type": "state",
+                                "state": "account_remaining_role_flow_retry_wait",
+                                "iteration": cycle,
+                                "processed_cycles": processed_cycles,
+                                "retry_count": incomplete_role_retry_count,
+                                "retry_limit": incomplete_role_retry_limit,
+                                "wait_seconds": incomplete_role_retry_wait_seconds,
+                                "action": "retry_same_unprocessed_role",
+                            }
+                        )
+                        self._sleep_with_watchdog(
+                            incomplete_role_retry_wait_seconds,
+                            source="account_remaining_role_flow_retry_wait",
+                        )
+                        self._watchdog_reset()
+                        continue
                     completion_reason = "role_flow_incomplete"
                     break
                 processed_role_templates.append(row_identity_crop.copy())
+                incomplete_role_retry_count = 0
                 processed_cycles += 1
                 if self._last_daily_like_done:
                     daily_like_done_count += 1
@@ -9235,15 +9545,17 @@ class SGZZStartAccountRunner:
             )
 
         processed_this_run = max(0, processed_cycles - processed_offset)
-        account_like_completed = processed_cycles > 0 and (
-            processed_this_run > 0
-            and completion_reason in {"all_roles_classified", "no_visible_or_hidden_roles"}
+        classified_this_run = processed_this_run + unavailable_role_count
+        account_like_completed = classified_this_run > 0 and (
+            completion_reason in {"all_roles_classified", "no_visible_or_hidden_roles"}
             and daily_like_done_count >= processed_this_run
         )
         self._last_account_cycle_summary = {
             "processed_cycles": processed_cycles,
             "processed_offset": processed_offset,
             "processed_this_run": processed_this_run,
+            "unavailable_role_count": unavailable_role_count,
+            "classified_this_run": classified_this_run,
             "daily_like_done_count": daily_like_done_count,
             "like_limit_stop_reached": like_limit_stop_reached,
             "like_limit_consecutive_count": like_limit_consecutive_count,
@@ -9438,6 +9750,30 @@ class SGZZStartAccountRunner:
                         )
                         continue
 
+                    account_cycle_summary = dict(self._last_account_cycle_summary)
+                    if not bool(account_cycle_summary.get("account_like_completed")):
+                        self._record(
+                            {
+                                "type": "state",
+                                "state": "account_batch_account_incomplete_halt",
+                                "index": index,
+                                "account_count": len(credentials),
+                                "account": credential.masked_account,
+                                "account_key": credential.account_key,
+                                "line_number": credential.line_number,
+                                "client": credential.client,
+                                "package": credential.package,
+                                "record_path": str(account_done_path),
+                                "action": "stop_without_switching_to_next_account",
+                                **account_cycle_summary,
+                            }
+                        )
+                        raise RuntimeError(
+                            f"Account {credential.masked_account} is incomplete "
+                            f"({account_cycle_summary.get('completion_reason', 'unknown')}); "
+                            "refusing to switch to the next account."
+                        )
+
                     self._record(
                         {
                             "type": "state",
@@ -9450,7 +9786,7 @@ class SGZZStartAccountRunner:
                             "client": credential.client,
                             "package": credential.package,
                             "record_path": str(account_done_path),
-                            **self._last_account_cycle_summary,
+                            **account_cycle_summary,
                         }
                     )
                     if index < len(credentials):
@@ -9875,17 +10211,27 @@ class SGZZStartAccountRunner:
                     threshold=0.66,
                     region=result_region,
                 )
-                add_button = self._find_template_in_image(
+                add_button_candidate = self._find_template_in_image(
                     result_image,
                     "like_friend_add_button",
-                    threshold=0.72,
+                    threshold=0.0,
                     region=button_region,
                 )
-                pending_button = self._find_template_in_image(
+                pending_button_candidate = self._find_template_in_image(
                     result_image,
                     "like_friend_add_pending_button",
-                    threshold=0.72,
+                    threshold=0.0,
                     region=button_region,
+                )
+                add_button = (
+                    add_button_candidate
+                    if add_button_candidate and add_button_candidate.score >= 0.72
+                    else None
+                )
+                pending_button = (
+                    pending_button_candidate
+                    if pending_button_candidate and pending_button_candidate.score >= 0.72
+                    else None
                 )
                 if result and add_button:
                     point = Point(*add_button.center)
@@ -9927,7 +10273,10 @@ class SGZZStartAccountRunner:
                         if confirmed
                         else "like_friend_request_sent_unconfirmed"
                     )
-                    return confirmed
+                    # The subsequent friend-list lookup is the authoritative check.
+                    # Retry it even when transient toast/button styling cannot confirm
+                    # the request immediately.
+                    return True
                 if result and pending_button:
                     self._record(
                         {
@@ -9938,6 +10287,37 @@ class SGZZStartAccountRunner:
                         }
                     )
                     self.screenshot("like_friend_request_already_pending")
+                    return True
+                if result:
+                    # The queried target is unambiguous, but client skins can render
+                    # the add/pending control differently. Clicking only inside the
+                    # exact result row is safe; the later friend-list retry still
+                    # decides whether the role can be marked complete.
+                    point = Point(
+                        button_region[0] + button_region[2] // 2,
+                        button_region[1] + button_region[3] // 2,
+                    )
+                    self._record(
+                        {
+                            "type": "vision_feature",
+                            "feature": "like_friend_result_action_fallback",
+                            "result_score": round(result.score, 4),
+                            "add_button_score": round(add_button_candidate.score, 4)
+                            if add_button_candidate
+                            else 0.0,
+                            "pending_button_score": round(pending_button_candidate.score, 4)
+                            if pending_button_candidate
+                            else 0.0,
+                            "tap_x": point.x,
+                            "tap_y": point.y,
+                        }
+                    )
+                    self.tap(
+                        "点赞流程-查询结果操作按钮-样式兜底",
+                        point,
+                        wait_seconds=self._fast_wait(1.4, 0.9),
+                    )
+                    self.screenshot("after_like_friend_result_action_fallback")
                     return True
                 if not search_retried and time() - search_started_at >= 2.5:
                     self.tap(

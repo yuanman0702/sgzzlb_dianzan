@@ -836,6 +836,21 @@ class SGZZStartAccountRunner:
         self._black_screen_started_at = 0.0
         self._black_screen_last_record_at = 0.0
 
+    def _watchdog_mark_forward_progress(self, *, source: str) -> None:
+        restart_streak = self._watchdog_restarts
+        self._watchdog_reset()
+        if restart_streak <= 0:
+            return
+        self._watchdog_restarts = 0
+        self._record(
+            {
+                "type": "state",
+                "state": "watchdog_restart_streak_reset",
+                "source": source,
+                "previous_restart_streak": restart_streak,
+            }
+        )
+
     @staticmethod
     def _watchdog_regions(image: np.ndarray) -> list[tuple[str, int, int, int, int]]:
         h, w = image.shape[:2]
@@ -3983,6 +3998,19 @@ class SGZZStartAccountRunner:
                         "state": "portrait_dialogs_done",
                         "reason": "main_screen_visible_with_false_continue_icon",
                         "after_taps": index,
+                    }
+                )
+                break
+
+            if recruit_visible and continue_icon.score < 0.50:
+                self._watchdog_reset()
+                self._record(
+                    {
+                        "type": "state",
+                        "state": "portrait_dialogs_done",
+                        "reason": "low_confidence_continue_icon_with_main_marker",
+                        "after_taps": index,
+                        "continue_score": round(continue_icon.score, 4),
                     }
                 )
                 break
@@ -9504,6 +9532,9 @@ class SGZZStartAccountRunner:
                 processed_role_templates.append(row_identity_crop.copy())
                 incomplete_role_retry_count = 0
                 processed_cycles += 1
+                self._watchdog_mark_forward_progress(
+                    source="account_remaining_role_completed"
+                )
                 if self._last_daily_like_done:
                     daily_like_done_count += 1
                 if self._last_like_limit_reached:

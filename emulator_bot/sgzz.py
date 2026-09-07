@@ -5176,6 +5176,50 @@ class SGZZStartAccountRunner:
         h, w = image.shape[:2]
         region = (int(w * 0.78), int(h * 0.86), int(w * 0.22), int(h * 0.14))
 
+        full_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        full_dark_ratio = float((full_gray < 70).mean())
+        overlay_mean = 255.0
+        overlay_dark_ratio = 0.0
+        continue_icon = None
+        if w < h:
+            overlay = image[int(h * 0.50) : int(h * 0.70), int(w * 0.25) : int(w * 0.98)]
+            overlay_gray = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
+            overlay_mean = float(overlay_gray.mean())
+            overlay_dark_ratio = float((overlay_gray < 70).mean())
+            continue_icon = self._find_template_in_image(
+                image,
+                "dialog_continue_icon",
+                threshold=0.45,
+                region=(int(w * 0.76), int(h * 0.50), int(w * 0.24), int(h * 0.32)),
+            )
+        overlay_blocks_main = (
+            full_dark_ratio >= 0.72
+            or (
+                overlay_mean <= 92
+                and overlay_dark_ratio >= 0.45
+                and continue_icon is not None
+            )
+        )
+        if overlay_blocks_main:
+            self._record(
+                {
+                    "type": "vision_feature",
+                    "feature": "like_main_screen_rejected_dialog_overlay",
+                    "full_dark_ratio": round(full_dark_ratio, 3),
+                    "overlay_mean": round(overlay_mean, 1),
+                    "overlay_dark_ratio": round(overlay_dark_ratio, 3),
+                    "continue_x": continue_icon.x if continue_icon else None,
+                    "continue_y": continue_icon.y if continue_icon else None,
+                    "continue_score": round(continue_icon.score, 4) if continue_icon else 0.0,
+                    "reason": (
+                        "full_screen_too_dark"
+                        if full_dark_ratio >= 0.72
+                        else "dialog_overlay_present"
+                    ),
+                }
+            )
+            return False
+
         recruit = self._find_template_in_image(
             image,
             "main_recruit_button",
@@ -5254,31 +5298,6 @@ class SGZZStartAccountRunner:
             )
             self._watchdog_reset()
             return True
-
-        if w < h:
-            overlay = image[int(h * 0.50) : int(h * 0.70), int(w * 0.25) : int(w * 0.98)]
-            overlay_gray = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
-            overlay_mean = float(overlay_gray.mean())
-            overlay_dark_ratio = float((overlay_gray < 70).mean())
-            continue_icon = self._find_template_in_image(
-                image,
-                "dialog_continue_icon",
-                threshold=0.45,
-                region=(int(w * 0.76), int(h * 0.50), int(w * 0.24), int(h * 0.32)),
-            )
-            if overlay_mean <= 92 and overlay_dark_ratio >= 0.45 and continue_icon:
-                self._record(
-                    {
-                        "type": "vision_feature",
-                        "feature": "like_main_screen_rejected_dialog_overlay",
-                        "overlay_mean": round(overlay_mean, 1),
-                        "overlay_dark_ratio": round(overlay_dark_ratio, 3),
-                        "continue_x": continue_icon.x,
-                        "continue_y": continue_icon.y,
-                        "continue_score": round(continue_icon.score, 4),
-                    }
-                )
-                return False
 
         self._record(
             {
@@ -8325,6 +8344,26 @@ class SGZZStartAccountRunner:
                     }
                 )
                 return self.screenshot("after_account_switch_to_role_select")
+
+        main_screen_ready = self.detect_like_main_screen()
+        if not main_screen_ready:
+            main_screen_ready = self.recover_to_main_screen(max_steps=10)
+            self._record(
+                {
+                    "type": "state",
+                    "state": "account_switch_main_screen_recovery",
+                    "recovered": main_screen_ready,
+                }
+            )
+        if not main_screen_ready:
+            image = self.bot.screenshot_image()
+            self._restart_game_after_stuck(
+                source="account_switch_main_screen_recovery_failed",
+                elapsed_seconds=0.0,
+                stable_regions=["account_switch_recovery"],
+                diffs={},
+                image=image,
+            )
 
         image = self.bot.screenshot_image()
         h, w = image.shape[:2]
